@@ -1,0 +1,11 @@
+provider: "openai"
+
+openai:
+  model: "gpt-4o-mini"
+
+anthropic:
+  model: "claude-haiku-4-5"
+
+generation:
+  temperature: 0.2
+  max_output_tokens: 4096
