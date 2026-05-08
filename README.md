@@ -1,8 +1,5 @@
 # cada1067_alpha
 
-LLM-assisted EDA netlist exploration and transformation system.  
-ICCAD 2026 Contest Problem A Implementation.
-
 ---
 
 ## Installation
