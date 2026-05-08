@@ -28,7 +28,7 @@ run_test() {
     # Remove stale log
     rm -f "$log_file"
 
-    python3 cada0001_alpha -config config.yaml < "$stdin_file"
+    python3 cada1067_alpha -config config.yaml < "$stdin_file"
 
     if [[ -f "$log_file" ]]; then
         echo "[PASS] $name — log file created: $log_file"
