@@ -38,7 +38,7 @@ class IOHandler:
                 self._log_file.close()
             except OSError:
                 pass
-        self._log_file = open(path, "a", encoding="utf-8")  # noqa: WPS515
+        self._log_file = open(path, "a", encoding="utf-8")
 
     def run(self) -> None:
         """Main loop: read lines from stdin, invoke the agent, write responses.
@@ -56,7 +56,7 @@ class IOHandler:
 
             try:
                 response_text = self._agent.process_request(line)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 response_text = f"[ERROR] {exc}"
 
             self._emit_response(resp_id, response_text)

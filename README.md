@@ -6,7 +6,7 @@
 
 ### 1. Prerequisites
 
-- Python 3.9 or later
+- Python 3.10 or later
 - An OpenAI API key
 
 ### 2. Install dependencies

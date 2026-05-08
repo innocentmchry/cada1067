@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal as _signal
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +71,22 @@ class EDAAgent:
         self._config = config
         self._engine = eda_engine
         self._io_handler: Optional[Any] = None  # set later by IOHandler
+        self._current_case_name: str = ""
+
+        # Developer mode — when enabled, loads the conversation logger
+        dev_cfg = config.get("developer", {})
+        self._developer_mode: bool = bool(dev_cfg.get("mode", False))
+        if self._developer_mode:
+            from .developer import ConversationLogger, NoopLogger, get_logs_dir, extract_case_name  # noqa: E501
+            log_base = dev_cfg.get("log_dir", None)
+            self._logs_dir = get_logs_dir(log_base if log_base else None)
+            self._LoggerCls = ConversationLogger
+            self._extract_case_name = extract_case_name
+        else:
+            from .developer import NoopLogger  # noqa: E501
+            self._logs_dir = Path(".")  # unused dummy
+            self._LoggerCls = NoopLogger
+            self._extract_case_name = lambda _: ""
 
         provider = config.get("provider", "openai").lower()
         if provider == "openai":
@@ -114,12 +131,16 @@ class EDAAgent:
         """Register the IOHandler so the agent can call set_log_file."""
         self._io_handler = io_handler
 
+    # A simple counter for log-file naming (shared across all requests)
+    _request_counter: int = 0
+
     def process_request(self, user_message: str) -> str:
         """Process a natural-language EDA request and return a text response.
 
         Sends user_message to the LLM with function-calling enabled,
         dispatches tool calls to the EDA engine, and loops until the model
-        returns a final text response.
+        returns a final text response.  When developer mode is enabled in
+        config.yaml, the full conversation is logged to logs/.
 
         Args:
             user_message: The user's natural-language request.
@@ -130,41 +151,70 @@ class EDAAgent:
         Raises:
             RuntimeError: On API errors or unsupported configurations.
         """
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
+        EDAAgent._request_counter += 1
 
-        while True:
-            timeout = _FAST_TIMEOUT  # conservative default
-            response = self._call_llm(messages, timeout)
+        # Extract case name; if not found in this line, reuse the last known one
+        label = self._extract_case_name(user_message)
+        if label:
+            self._current_case_name = label
+        else:
+            label = self._current_case_name
 
-            choice = response.choices[0]
-            msg = choice.message
+        with self._LoggerCls(
+            EDAAgent._request_counter, self._logs_dir, self._model, label=label
+        ) as conv_log:
+            conv_log.log_user_input(user_message)
 
-            # Append assistant message to history
-            messages.append(msg.model_dump(exclude_unset=False))
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ]
 
-            if choice.finish_reason == "tool_calls" and msg.tool_calls:
-                # Dispatch each tool call
-                for tc in msg.tool_calls:
-                    tool_name = tc.function.name
-                    op_timeout = (
-                        _FAST_TIMEOUT if tool_name in _FAST_OPS else _SLOW_TIMEOUT
-                    )
-                    result_str = self._dispatch_tool(
-                        tool_name, tc.function.arguments, op_timeout
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": result_str,
-                        }
-                    )
-            else:
-                # Final text response
-                return msg.content or ""
+            turn = 0
+            while True:
+                turn += 1
+                timeout = _FAST_TIMEOUT  # conservative default
+
+                conv_log.log_llm_prompt(messages, turn)
+                t0 = time.monotonic()
+                response = self._call_llm(messages, timeout)
+                elapsed = time.monotonic() - t0
+                conv_log.log_llm_response(response, turn, elapsed)
+
+                choice = response.choices[0]
+                msg = choice.message
+
+                # Append assistant message to history
+                messages.append(msg.model_dump(exclude_unset=False))
+
+                if choice.finish_reason == "tool_calls" and msg.tool_calls:
+                    # Dispatch each tool call
+                    for tc in msg.tool_calls:
+                        tool_name = tc.function.name
+                        op_timeout = (
+                            _FAST_TIMEOUT if tool_name in _FAST_OPS else _SLOW_TIMEOUT
+                        )
+                        result_str = self._dispatch_tool(
+                            tool_name, tc.function.arguments, op_timeout
+                        )
+                        conv_log.log_tool_result(tool_name, result_str)
+
+                        # If a design was just loaded, dump the netlist to the log
+                        if tool_name == "read_design":
+                            conv_log.log_netlist(self._engine.netlist)
+
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": result_str,
+                            }
+                        )
+                else:
+                    # Final text response
+                    final_text = msg.content or ""
+                    conv_log.log_final_response(final_text)
+                    return final_text
 
     # ------------------------------------------------------------------
     # Internal: LLM call
