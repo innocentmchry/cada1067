@@ -1,7 +1,7 @@
-# cada0001_alpha
+# cada1067_alpha
 
 LLM-assisted EDA netlist exploration and transformation system.  
-ICCAD 2026 Contest Problem A — Reference Implementation.
+ICCAD 2026 Contest Problem A Implementation.
 
 ---
 
@@ -40,7 +40,7 @@ export OPENAI_API_KEY="sk-..."
 ## Running the tool
 
 ```bash
-./cada0001_alpha -config config.yaml
+./cada1067_alpha -config config.yaml
 ```
 
 The tool reads natural-language requests from **stdin** (one per line) and
@@ -49,7 +49,7 @@ writes tagged responses to **stdout**.
 ### Piping a test case
 
 ```bash
-./cada0001_alpha -config config.yaml < examples/test8_stdin.txt
+./cada1067_alpha -config config.yaml < examples/test8_stdin.txt
 ```
 
 ---
@@ -129,8 +129,8 @@ The parser handles flat, single-module gate-level Verilog with:
 ## Project structure
 
 ```
-cada0001_alpha/
-├── cada0001_alpha          ← main executable
+cada1067_alpha/
+├── cada1067_alpha          ← main executable
 ├── config.yaml             ← LLM config (set your API key here)
 ├── requirements.txt
 ├── run_examples.sh         ← integration test runner
