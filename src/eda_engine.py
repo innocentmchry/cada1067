@@ -226,6 +226,8 @@ class EDAEngine:
 
         dfs_topo(source)
         topo_order.reverse()
+        # print(f"Topo Order is: ")
+        # print(topo_order)
 
         for sig in topo_order:
             for nxt in self._forward_successors(sig):
@@ -238,6 +240,9 @@ class EDAEngine:
 
         if sink not in dist:
             return (-1, [])
+
+        # print(dist)
+        # print(parent)
 
         # Reconstruct path
         path: List[str] = []

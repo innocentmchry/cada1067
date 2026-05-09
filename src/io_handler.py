@@ -45,7 +45,13 @@ class IOHandler:
 
         Reads until EOF.  After printing each ``#END <id>`` block, stdout is
         flushed before blocking on the next line.
+
+        A running context summary is built after each request and passed to
+        the next one so the LLM knows the current engine state (loaded design,
+        previous operation results, etc.).
         """
+        context_summary: str = ""
+
         for raw_line in sys.stdin:
             line = raw_line.rstrip("\n")
             if not line:
@@ -55,11 +61,14 @@ class IOHandler:
             resp_id = self._response_counter
 
             try:
-                response_text = self._agent.process_request(line)
+                response_text = self._agent.process_request(line, context_summary)
             except Exception as exc:
                 response_text = f"[ERROR] {exc}"
 
             self._emit_response(resp_id, response_text)
+
+            # Build context for the next request
+            context_summary = self._agent.build_state_summary()
 
         # Close log on EOF
         if self._log_file is not None:

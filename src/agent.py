@@ -72,6 +72,7 @@ class EDAAgent:
         self._engine = eda_engine
         self._io_handler: Optional[Any] = None  # set later by IOHandler
         self._current_case_name: str = ""
+        self._last_tool_result: str = ""
 
         # Developer mode — when enabled, loads the conversation logger
         dev_cfg = config.get("developer", {})
@@ -131,10 +132,84 @@ class EDAAgent:
         """Register the IOHandler so the agent can call set_log_file."""
         self._io_handler = io_handler
 
+    def build_state_summary(self) -> str:
+        """Return a short string describing the current engine state.
+
+        The IOHandler calls this after each request to feed context into
+        the next request.  Includes: testcase name, loaded design, last
+        operation performed.
+        """
+        parts: List[str] = []
+        if self._current_case_name:
+            parts.append(f"testcase='{self._current_case_name}'")
+
+        try:
+            nl = self._engine.netlist
+            # Count gates by type
+            gate_types: Dict[str, int] = {}
+            for g in nl.nodes.values():
+                gate_types[g.gate_type] = gate_types.get(g.gate_type, 0) + 1
+            type_summary = ", ".join(
+                f"{cnt}x {gt}" for gt, cnt in sorted(gate_types.items())
+            )
+            parts.append(
+                f"design loaded: '{nl.module_name}' "
+                f"({type_summary}; {len(nl.dffs)} DFFs; "
+                f"{len(nl.primary_inputs)} PIs, {len(nl.primary_outputs)} POs)"
+            )
+        except (ValueError, AttributeError):
+            pass  # no design loaded yet
+
+        # Last operation performed (tracked by _last_tool_result)
+        if hasattr(self, "_last_tool_result") and self._last_tool_result:
+            parts.append(f"last operation: {self._last_tool_result}")
+
+        return "; ".join(parts) if parts else "(no state)"
+
+    @staticmethod
+    def _summarize_tool_result(tool_name: str, result_str: str) -> str:
+        """Create a one-line summary of a tool result for context tracking."""
+        try:
+            result = json.loads(result_str)
+        except json.JSONDecodeError:
+            return f"{tool_name} completed"
+
+        if "error" in result:
+            return f"{tool_name} FAILED: {result['error']}"
+
+        data = result.get("result", result)
+
+        if tool_name == "read_design":
+            return f"loaded design via read_design"
+        elif tool_name == "write_design":
+            return f"wrote design via write_design"
+        elif tool_name == "set_testcase_name":
+            return f"testcase initialized via set_testcase_name"
+        elif tool_name == "get_max_depth":
+            return f"get_max_depth: depth={data.get('depth')}"
+        elif tool_name == "find_instances_by_name_pattern":
+            count = data.get("count", 0)
+            instances = data.get("instances", [])
+            return f"find_instances_by_name_pattern: found {count} instances ({', '.join(instances[:5])}{'...' if count > 5 else ''})"
+        elif tool_name == "replace_gate":
+            return f"replace_gate: {data.get('replaced')} → {data.get('new_type')}"
+        elif tool_name == "replace_pattern":
+            return f"replace_pattern: {data.get('replacements', 0)} replacements"
+        elif tool_name == "insert_buffers_for_fanout":
+            return f"insert_buffers_for_fanout: {data.get('buffers_inserted', 0)} buffers"
+        elif tool_name == "balance_depth":
+            return f"balance_depth: {data.get('buffers_inserted', 0)} buffers"
+        elif tool_name == "remove_dangling_gates":
+            return f"remove_dangling_gates: {data.get('gates_removed', 0)} gates removed"
+        elif tool_name == "optimize_cone_depth":
+            return f"optimize_cone_depth: {'OK' if data.get('success') else 'FAILED'}"
+        else:
+            return f"{tool_name} completed"
+
     # A simple counter for log-file naming (shared across all requests)
     _request_counter: int = 0
 
-    def process_request(self, user_message: str) -> str:
+    def process_request(self, user_message: str, context_summary: str = "") -> str:
         """Process a natural-language EDA request and return a text response.
 
         Sends user_message to the LLM with function-calling enabled,
@@ -142,8 +217,13 @@ class EDAAgent:
         returns a final text response.  When developer mode is enabled in
         config.yaml, the full conversation is logged to logs/.
 
+        If *context_summary* is non-empty, it is inserted as an additional
+        system message so the LLM knows the current engine state (loaded
+        design, previous operations, etc.).
+
         Args:
-            user_message: The user's natural-language request.
+            user_message:    The user's natural-language request.
+            context_summary: Optional summary of previous operations' state.
 
         Returns:
             Final text response from the LLM.
@@ -164,11 +244,18 @@ class EDAAgent:
             EDAAgent._request_counter, self._logs_dir, self._model, label=label
         ) as conv_log:
             conv_log.log_user_input(user_message)
+            if context_summary:
+                conv_log._fh.write(
+                    f"  ── CONTEXT ──\n  {context_summary}\n  ─────────────\n\n"
+                )
 
-            messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ]
+            messages: List[Dict[str, Any]] = []
+            messages.append({"role": "system", "content": _SYSTEM_PROMPT})
+            if context_summary:
+                messages.append(
+                    {"role": "system", "content": f"Current state: {context_summary}"}
+                )
+            messages.append({"role": "user", "content": user_message})
 
             turn = 0
             while True:
@@ -198,6 +285,11 @@ class EDAAgent:
                             tool_name, tc.function.arguments, op_timeout
                         )
                         conv_log.log_tool_result(tool_name, result_str)
+
+                        # Track last operation for context summary
+                        self._last_tool_result = self._summarize_tool_result(
+                            tool_name, result_str
+                        )
 
                         # If a design was just loaded, dump the netlist to the log
                         if tool_name == "read_design":

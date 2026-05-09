@@ -23,8 +23,8 @@ module test35 (
   and    U_gc__buf0           (w0, in0, _gc_ctrl);
   and    U23_gc__buf          (w1, in1, _gc_ctrl);
   and    buf_gc__stage3       (w2, in2, _gc_ctrl);
-  and    out_drv0             (out0, w0, _gc_ctrl);
-  and    out_drv1             (out1, w1, _gc_ctrl);
-  and    out_drv2             (out2, w2, _gc_ctrl);
+  buf    out_drv0             (out0, w0);
+  buf    out_drv1             (out1, w1);
+  buf    out_drv2             (out2, w2);
 
 endmodule
