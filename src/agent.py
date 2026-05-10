@@ -72,7 +72,7 @@ class EDAAgent:
         self._engine = eda_engine
         self._io_handler: Optional[Any] = None  # set later by IOHandler
         self._current_case_name: str = ""
-        self._last_tool_result: str = ""
+        self._context_history: List[str] = []
 
         # Developer mode — when enabled, loads the conversation logger
         dev_cfg = config.get("developer", {})
@@ -133,11 +133,12 @@ class EDAAgent:
         self._io_handler = io_handler
 
     def build_state_summary(self) -> str:
-        """Return a short string describing the current engine state.
+        """Return a short string describing the current engine state and all
+        previous operations for this testcase.
 
         The IOHandler calls this after each request to feed context into
-        the next request.  Includes: testcase name, loaded design, last
-        operation performed.
+        the next request.  Includes: testcase name, loaded design, and
+        the full history of operations performed so far.
         """
         parts: List[str] = []
         if self._current_case_name:
@@ -145,7 +146,6 @@ class EDAAgent:
 
         try:
             nl = self._engine.netlist
-            # Count gates by type
             gate_types: Dict[str, int] = {}
             for g in nl.nodes.values():
                 gate_types[g.gate_type] = gate_types.get(g.gate_type, 0) + 1
@@ -153,18 +153,20 @@ class EDAAgent:
                 f"{cnt}x {gt}" for gt, cnt in sorted(gate_types.items())
             )
             parts.append(
-                f"design loaded: '{nl.module_name}' "
+                f"design: '{nl.module_name}' "
                 f"({type_summary}; {len(nl.dffs)} DFFs; "
                 f"{len(nl.primary_inputs)} PIs, {len(nl.primary_outputs)} POs)"
             )
         except (ValueError, AttributeError):
             pass  # no design loaded yet
 
-        # Last operation performed (tracked by _last_tool_result)
-        if hasattr(self, "_last_tool_result") and self._last_tool_result:
-            parts.append(f"last operation: {self._last_tool_result}")
+        # Full operation history
+        if self._context_history:
+            parts.append("operations so far:")
+            for item in self._context_history:
+                parts.append(f"  - {item}")
 
-        return "; ".join(parts) if parts else "(no state)"
+        return "\n".join(parts) if parts else "(no state)"
 
     @staticmethod
     def _summarize_tool_result(tool_name: str, result_str: str) -> str:
@@ -286,10 +288,11 @@ class EDAAgent:
                         )
                         conv_log.log_tool_result(tool_name, result_str)
 
-                        # Track last operation for context summary
-                        self._last_tool_result = self._summarize_tool_result(
+                        # Track operation in context history
+                        summary = self._summarize_tool_result(
                             tool_name, result_str
                         )
+                        self._context_history.append(summary)
 
                         # If a design was just loaded, dump the netlist to the log
                         if tool_name == "read_design":
