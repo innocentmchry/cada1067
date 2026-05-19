@@ -1,2 +1,6 @@
 .env
 logs/
+A_release testcase_0510/
+examples_output/
+testcase/
+testcase_output/

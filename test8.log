@@ -1,9 +1,0 @@
-#RESPONSE 1
-The testcase name has been set to 'test8', and the log file is 'test8.log'.
-#END 1
-#RESPONSE 2
-The file 'test8.v' has been successfully loaded from the directory 'design/netlist/'.
-#END 2
-#RESPONSE 3
-The maximum logic depth from input `in0` to output `out3` is 5. The path taken is: `in0` → `n_in0_n` → `n1` → `n2` → `n3` → `out3`.
-#END 3

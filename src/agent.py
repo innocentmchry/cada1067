@@ -403,14 +403,26 @@ class EDAAgent:
             return f"Design loaded from {args['filepath']!r}"
 
         if tool_name == "write_design":
-            eng.save(args["filepath"])
-            return f"Design written to {args['filepath']!r}"
+            filepath: str = args["filepath"]
+            # If a testcase name is set, redirect output to <OUTPUT_DIR>/<name>/
+            if self._current_case_name:
+                out_base = os.environ.get("OUTPUT_DIR", "testcase_output")
+                out_dir = os.path.join(out_base, self._current_case_name)
+                os.makedirs(out_dir, exist_ok=True)
+                filepath = os.path.join(out_dir, os.path.basename(filepath))
+            eng.save(filepath)
+            return f"Design written to {filepath!r}"
 
         if tool_name == "set_testcase_name":
             case_name: str = args["case_name"]
-            log_path: str = args.get("log_path") or f"{case_name}.log"
+            # Place logs inside <OUTPUT_DIR>/<case_name>/
+            out_base = os.environ.get("OUTPUT_DIR", "testcase_output")
+            out_dir = os.path.join(out_base, case_name)
+            os.makedirs(out_dir, exist_ok=True)
+            log_path: str = os.path.join(out_dir, args.get("log_path") or f"{case_name}.log")
             if self._io_handler is not None:
                 self._io_handler.set_log_file(log_path)
+            self._current_case_name = case_name
             return f"Testcase name set to {case_name!r}; log file: {log_path!r}"
 
         if tool_name == "get_max_depth":
