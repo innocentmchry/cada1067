@@ -153,6 +153,7 @@ class EDAEngine:
         for node in nl.nodes.values():
             if signal in node.inputs:
                 result.append(node.output)
+        
         return result
 
     def _backward_predecessors(self, signal: str) -> List[str]:
@@ -171,6 +172,89 @@ class EDAEngine:
     # ANALYSIS OPERATIONS
     # ==================================================================
 
+    def count_gates(self):
+        """Return gate counts grouped by type."""
+
+        if self.netlist is None:
+            return {"error": "No design loaded"}
+
+        counts = {
+            "AND": 0,
+            "OR": 0,
+            "NOT": 0,
+            "NAND": 0,
+            "NOR": 0,
+            "XOR": 0,
+            "XNOR": 0,
+            "BUF": 0,
+            "DFF": 0,
+        }
+
+        # Count combinational gates
+        for node in self.netlist.nodes.values():
+            gt = node.gate_type.upper()
+
+            if gt in counts:
+                counts[gt] += 1
+
+        # Count DFFs separately
+        counts["DFF"] = len(self.netlist.dffs)
+
+        total = sum(counts.values())
+
+        return {
+            "total_gates": total,
+            "breakdown": counts,
+        }
+    def _driver_of(self, signal: str):
+        """Return gate driving this signal, or None."""
+
+        for node in self.netlist.nodes.values():
+            if node.output == signal:
+                return node
+
+        return None
+    
+    def _fanin_depth(self, signal: str, memo=None) -> int:
+        """Return max logic depth ending at signal."""
+
+        if memo is None:
+            memo = {}
+
+        if signal in memo:
+            return memo[signal]
+
+        # Primary input
+        if signal in self.netlist.primary_inputs:
+            memo[signal] = 0
+            return 0
+
+        driver = self._driver_of(signal)
+
+        # No driver
+        if driver is None:
+            memo[signal] = 0
+            return 0
+
+        depth = 1 + max(
+            self._fanin_depth(inp, memo)
+            for inp in driver.inputs
+        )
+
+        memo[signal] = depth
+        return depth
+    
+    def get_fanin_cone_depth(self, output_signal: str):
+        """Return max logic depth of output fanin cone."""
+
+        self._require_netlist()
+        self._resolve_signal(output_signal)
+
+        return {
+            "output": output_signal,
+            "depth": self._fanin_depth(output_signal)
+        }
+        
     def get_max_depth(
         self, source: str, sink: str
     ) -> Tuple[int, List[str]]:
@@ -354,6 +438,94 @@ class EDAEngine:
             output_signal: The target output net name.
         """
         return len(self.get_logic_cone(output_signal))
+    def _nodes_reaching_sink(self, sink: str) -> Set[str]:
+        """Return all signals that can reach sink."""
+
+        reachable: Set[str] = set()
+        queue: deque[str] = deque([sink])
+
+        while queue:
+
+            cur = queue.popleft()
+
+            if cur in reachable:
+                continue
+
+            reachable.add(cur)
+
+            for prev in self._backward_predecessors(cur):
+                queue.append(prev)
+
+        return reachable
+    def find_all_paths(
+        self,
+        source: str,
+        sink: str,
+        max_paths: int = 500
+    ):
+
+        self._require_netlist()
+
+        sink_reachable = self._nodes_reaching_sink(sink)
+
+        paths = []
+
+        self._dfs_paths(
+            current=source,
+            sink=sink,
+            path=[source],
+            paths=paths,
+            max_paths=max_paths,
+            sink_reachable=sink_reachable,
+        )
+
+        return {
+            "source": source,
+            "sink": sink,
+            "count": len(paths),
+            "paths": paths,
+            "truncated": len(paths) >= max_paths,
+        }
+    def _dfs_paths(
+        self,
+        current: str,
+        sink: str,
+        path: list[str],
+        paths: list[list[str]],
+        max_paths: int,
+        sink_reachable: Set[str],
+    ):
+
+        if len(paths) >= max_paths:
+            return
+
+        if current == sink:
+            paths.append(path.copy())
+            return
+
+        for nxt in self._forward_successors(current):
+
+            # prune impossible branches
+            if nxt not in sink_reachable:
+                continue
+
+            # avoid cycles
+            if nxt in path:
+                continue
+
+            path.append(nxt)
+
+            self._dfs_paths(
+                current=nxt,
+                sink=sink,
+                path=path,
+                paths=paths,
+                max_paths=max_paths,
+                sink_reachable=sink_reachable,
+            )
+
+            path.pop()
+            
 
     def get_fanout(self, net_name: str) -> List[str]:
         """Return all gate instance names driven by net_name.
@@ -364,6 +536,17 @@ class EDAEngine:
         self._require_netlist()
         self._resolve_signal(net_name)
         return self._build_fanout_map().get(net_name, [])
+    
+    def get_gate_fanout(self, gate_name: str):
+        nl = self._netlist
+        assert nl is not None
+
+        if gate_name not in nl.nodes:
+            raise ValueError(f"Unknown gate: {gate_name}")
+
+        output_signal = nl.nodes[gate_name].output
+
+        return self.get_fanout(output_signal)
 
     def are_same_clock_domain(self, dff1: str, dff2: str) -> bool:
         """Return True if both DFFs share the same clock net.

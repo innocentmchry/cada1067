@@ -17,7 +17,7 @@ class IOHandler:
 
     def __init__(self, agent: EDAAgent) -> None:
         self._agent = agent
-        self._agent.set_io_handler(self)
+        self._agent.set_io_handler(self) #bidirectional linkage between IOhandler and agent
         self._log_file: Optional[IO[str]] = None
         self._response_counter: int = 0
 
