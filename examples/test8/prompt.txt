@@ -1,3 +1,0 @@
-This is the beginning of a new testcase. The case name is 'test8'
-Now please load file 'test8.v' in directory 'examples/test8/'
-What is the maximum logic depth from input in0 to output out3?

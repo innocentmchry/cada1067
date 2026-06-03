@@ -51,6 +51,8 @@ _SYSTEM_PROMPT = (
     "a gate-level Verilog netlist, call the appropriate tool(s) in the correct order. "
     "After all tool calls are complete, return a concise, clear natural-language answer "
     "describing what was found or what was changed. Do not discuss scoring or evaluation."
+    "For any numerical/statistical query about the design."
+    "you MUST use tools instead of estimating from memory or summaries."
 )
 
 # Timeouts (seconds) per category
@@ -189,6 +191,19 @@ class EDAAgent:
             return f"testcase initialized via set_testcase_name"
         elif tool_name == "get_max_depth":
             return f"get_max_depth: depth={data.get('depth')}"
+        elif tool_name == "get_fanin_cone_depth":
+            return (
+                f"fanin cone depth of "
+                f"{data.get('output')} = "
+                f"{data.get('depth')}"
+            )
+        elif tool_name == "find_all_paths":
+            return (
+                f"find_all_paths: "
+                f"{data.get('count')} paths "
+                f"from {data.get('source')} "
+                f"to {data.get('sink')}"
+            )
         elif tool_name == "find_instances_by_name_pattern":
             count = data.get("count", 0)
             instances = data.get("instances", [])
@@ -413,6 +428,10 @@ class EDAAgent:
             eng.save(filepath)
             return f"Design written to {filepath!r}"
 
+        if tool_name == "count_gates":
+            return eng.count_gates()
+
+
         if tool_name == "set_testcase_name":
             case_name: str = args["case_name"]
             # Place logs inside <OUTPUT_DIR>/<case_name>/
@@ -429,6 +448,10 @@ class EDAAgent:
             depth, path = eng.get_max_depth(args["source"], args["sink"])
             return {"depth": depth, "path": path}
 
+        if tool_name == "get_fanin_cone_depth":
+            return eng.get_fanin_cone_depth(
+                args["output_signal"]
+            )
         if tool_name == "path_passes_through":
             result = eng.path_passes_through(
                 args["source"], args["sink"], args["node"]
@@ -448,11 +471,18 @@ class EDAAgent:
         if tool_name == "count_cone_gates":
             count = eng.count_cone_gates(args["output_signal"])
             return {"count": count}
-
+        if tool_name == "find_all_paths":
+            return eng.find_all_paths(
+                args["source"],
+                args["sink"]
+            )
         if tool_name == "get_fanout":
             fanout = eng.get_fanout(args["net_name"])
             return {"fanout": fanout, "count": len(fanout)}
-
+        if tool_name == "get_gate_fanout":
+            return eng.get_gate_fanout(
+                args["gate_name"]
+            )
         if tool_name == "are_same_clock_domain":
             same = eng.are_same_clock_domain(args["dff1"], args["dff2"])
             return {"same_clock_domain": same}

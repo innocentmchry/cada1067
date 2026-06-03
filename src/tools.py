@@ -50,6 +50,23 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "count_gates",
+            "description": (
+                "Count all gates in the currently loaded design "
+                "and return totals grouped by gate type."
+                "Invoke this whitout fail when asked for count all the gates "
+                "Invoke this whitout fail when asked to Compute the total gate count of the design. "
+
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "set_testcase_name",
             "description": (
                 "Call this when the user specifies a testcase name (e.g., 'test8', 'test35'). "
@@ -77,9 +94,30 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_fanin_cone_depth",
+            "description": (
+                "Return the maximum logic depth "
+                "of the fanin cone of an output signal."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string"
+                    }
+                },
+                "required": ["output_signal"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_max_depth",
             "description": (
-                "Call this to find the longest combinational path (maximum logic depth) "
+                "Invoke this whitout fail when asked to to find the longest combinational path (maximum logic depth) "
+                "Invoke this whitout fail when asked to calculate critical path depth"
+                "Invoke this whitout fail when asked to"
                 "between a source signal and a sink signal. "
                 "DFF boundaries are treated as cuts. "
                 "Returns the depth (integer) and the list of signals on the longest path."
@@ -189,6 +227,31 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_all_paths",
+            "description": (
+                "List all combinational paths "
+                "between a source signal and sink signal."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string"
+                    },
+                    "sink": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "source",
+                    "sink"
+                ]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_fanout",
             "description": (
                 "Call this to find all gate instances that are directly driven by a given net. "
@@ -204,6 +267,24 @@ TOOLS: List[Dict[str, Any]] = [
                 },
                 "required": ["net_name"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_gate_fanout",
+            "description": (
+                "Return gates driven by a gate instance."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_name": {
+                        "type": "string"
+                    }
+                },
+                "required": ["gate_name"]
+            }
         },
     },
     {

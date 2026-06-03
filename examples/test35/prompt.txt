@@ -1,5 +1,0 @@
-This is the beginning of a new testcase. The case name is 'test35'
-Now please load file 'test35.v' from directory 'examples/test35/'
-Find all the buffers which name include '_gc__'
-Replace the found buffers with an AND gate. And connect the other input to _gc_ctrl
-Write out the modified netlist into 'test35_out.v', please.
