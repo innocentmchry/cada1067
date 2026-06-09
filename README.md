@@ -54,17 +54,33 @@ For running all testcases use the following command after downloading the testca
 
 ```
 bash run.sh testcase
-
 ```
-
-The script runs testcases and checks that the corresponding
-`.log` files are created.
 
 The script creates an output folder named testcase_output which contains the log files of the folder testcase
 
 ---
 
-## Analysing the Log file
+
+## Output format
+
+Every response is wrapped in `#RESPONSE` / `#END` tags:
+
+```
+#RESPONSE 1
+Testcase name has been set to 'test8'. Log file: test8.log
+#END 1
+
+#RESPONSE 2
+Design loaded from 'examples/test8/test8.v'.
+#END 2
+
+#RESPONSE 3
+The maximum logic depth from in0 to out3 is 5 gate levels.
+Path: in0 → n_in0_n → n1 → n2 → n3 → out3
+#END 3
+```
+
+## Analysing the Developer mode Log file
 
 The logs directory contains all the LLM tool mode runs for all testcases for developer mode turned on in config
 
@@ -85,24 +101,6 @@ writes tagged responses to **stdout**.
 
 ---
 
-## Output format
-
-Every response is wrapped in `#RESPONSE` / `#END` tags:
-
-```
-#RESPONSE 1
-Testcase name has been set to 'test8'. Log file: test8.log
-#END 1
-
-#RESPONSE 2
-Design loaded from 'examples/test8/test8.v'.
-#END 2
-
-#RESPONSE 3
-The maximum logic depth from in0 to out3 is 5 gate levels.
-Path: in0 → n_in0_n → n1 → n2 → n3 → out3
-#END 3
-```
 
 
 ---
