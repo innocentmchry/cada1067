@@ -528,20 +528,23 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "check_equivalence",
             "description": (
-                "Call this to verify that the current netlist is functionally equivalent "
-                "to a previously saved snapshot for the given output signal. "
-                "Uses truth-table comparison for cones with up to 20 primary inputs. "
-                "Returns true if both netlists produce identical logic."
+                "Call this to verify that two signals in the current netlist are functionally equivalent. "
+                "Uses Yosys SAT solver for precise equivalence checking on circuits of any size. "
+                "Returns true if the signals are logically equivalent, false otherwise."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "output": {
+                    "sig1": {
                         "type": "string",
-                        "description": "Output signal name to compare between current netlist and snapshot.",
+                        "description": "First signal name to compare.",
+                    },
+                    "sig2": {
+                        "type": "string",
+                        "description": "Second signal name to compare.",
                     }
                 },
-                "required": ["output"],
+                "required": ["sig1", "sig2"],
             },
         },
     },

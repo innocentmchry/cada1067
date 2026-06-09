@@ -8,6 +8,7 @@
 
 - Python 3.10 or later
 - An OpenAI API key
+- Yosys (for equivalence checking)
 
 ### 2. Install dependencies
 
@@ -30,11 +31,41 @@ Alternatively, export the environment variable:
 
 ```bash
 export OPENAI_API_KEY="sk-..."
+or
+create a .env file with content OPENAI_API_KEY="sk-..."
 ```
 
 ---
 
-## Running the tool
+## Running the tests
+
+Download the testcase from ICCAD contest page
+Initially create an examples folder for analysing single test case
+
+
+```bash
+bash run.sh examples
+```
+
+For running all testcases use the following command. (Don't run it always because llm api tokens are limited, Run only once and analyse the results one by one by putting it inside examples folder)
+
+```
+bash run.sh testcase
+
+```
+
+The script runs testcases and checks that the corresponding
+`.log` files are created.
+
+The script creates an output folder named examples_output which contains the log files of the folder names examples
+
+---
+
+## Analysing the Log file
+
+The logs directory contains all the LLM tool mode runs for all testcases for developer mode turned on in config
+
+## Running the tool (For bundled version)
 
 ```bash
 ./cada1067_alpha -config config.yaml
@@ -75,16 +106,6 @@ is set (via the `set_testcase_name` tool call triggered by the first request).
 
 ---
 
-## Running the integration tests
-
-```bash
-bash run_examples.sh
-```
-
-The script runs both example testcases and checks that the corresponding
-`.log` files are created.  It prints `PASS` or `FAIL` for each.
-
----
 
 ## Supported EDA operations
 
@@ -108,7 +129,7 @@ The script runs both example testcases and checks that the corresponding
 | `optimize_cone_depth` | Restructure a cone to meet a depth constraint |
 | `replace_pattern` | Bulk gate-type replacement by pattern |
 | `find_instances_by_name_pattern` | Search instances by type and name regex |
-| `check_equivalence` | Verify functional equivalence against a snapshot |
+| `check_equivalence` | Check if two signals in the netlist are functionally equivalent |
 
 ---
 
@@ -117,7 +138,7 @@ The script runs both example testcases and checks that the corresponding
 The parser handles flat, single-module gate-level Verilog with:
 
 - Primitive gates: `and`, `or`, `nand`, `nor`, `not`, `buf`, `xor`, `xnor`
-- Flip-flops: `dff` instances with ports `(clk, rst_n, d, q)`
+- Flip-flops: `dff` instances with named ports `.RN()`, `.SN()`, `.CK()`, `.D()`, `.Q()` or legacy ordered ports `(clk, rst_n, d, q)`
 - Scalar and bus wire / port declarations (e.g. `wire [31:0] a`)
 - Constants: `1'b0`, `1'b1`
 

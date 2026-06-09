@@ -42,8 +42,9 @@ class GateNode:
 class DFFNode:
     """Represents a flip-flop (dff) instance."""
     name: str
-    clk: str = ""
-    rst_n: str = ""
+    ck: str = ""
+    rn: str = ""
+    sn: str = ""
     d: str = ""
     q: str = ""
 
@@ -223,7 +224,7 @@ def parse_verilog(filepath: str) -> Netlist:
     # -----------------------------------------------------------------------
     # Pattern: gate_type  instance_name  ( port, port, ... ) ;
     inst_pattern = re.compile(
-        r"\b(\w+)\s+(\w+)\s*\(([^)]*)\)\s*;",
+        r"\b(\w+)\s+(\w+)\s*\((.*?)\)\s*;",
         re.DOTALL,
     )
 
@@ -252,16 +253,43 @@ def parse_verilog(filepath: str) -> Netlist:
 
 
 def _parse_dff(netlist: Netlist, inst_name: str, ports: List[str]) -> None:
-    """Add a DFF node from an ordered port list (clk, rst_n, d, q)."""
+    """Add a DFF node.
+
+    Supports both ordered port lists (clk, rst_n, d, q) and named-port
+    connections like `.RN(n1), .SN(1'b1), .CK(n0), .D(n49[2]), .Q(n194[2])`.
+    """
+    # Detect named-port style tokens starting with '.'
+    named = any(p.strip().startswith('.') for p in ports)
+    if named:
+        mapping = {}
+        for p in ports:
+            m = re.match(r"\.\s*(\w+)\s*\(\s*(.*?)\s*\)\s*$", p)
+            if not m:
+                raise ParseError(f"Cannot parse named port token: {p!r}")
+            pname = m.group(1).lower()
+            psig = _resolve_port_signal(m.group(2))
+            mapping[pname] = psig
+
+        dff = DFFNode(
+            name=inst_name,
+            ck=mapping.get('ck', ''),
+            rn=mapping.get('rn', ''),
+            sn=mapping.get('sn', ''),
+            d=mapping.get('d', ''),
+            q=mapping.get('q', ''),
+        )
+        netlist.dffs[inst_name] = dff
+        return
+
+    # Fallback: ordered-port style (clk, rst_n, d, q)
     if len(ports) != 4:
         raise ParseError(
-            f"DFF instance {inst_name!r} expects 4 ports (clk, rst_n, d, q), "
-            f"got {len(ports)}: {ports}"
+            f"DFF instance {inst_name!r} expects 4 ports (clk, rst_n, d, q), got {len(ports)}: {ports}"
         )
     dff = DFFNode(
         name=inst_name,
-        clk=ports[0],
-        rst_n=ports[1],
+        ck=ports[0],
+        rn=ports[1],
         d=ports[2],
         q=ports[3],
     )
@@ -364,9 +392,10 @@ def write_verilog(netlist: Netlist, filepath: str) -> None:
             ports = f"{node.output}, {node.inputs[0]}, {node.inputs[1]}"
         lines.append(f"  {node.gate_type:<6} {inst_name:<20} ({ports});")
 
-    # DFF instances
+    # DFF instances (written using named-port syntax)
     for inst_name, dff in netlist.dffs.items():
-        ports = f"{dff.clk}, {dff.rst_n}, {dff.d}, {dff.q}"
+        sn_val = dff.sn if dff.sn else "1'b1"
+        ports = f".RN({dff.rn}), .SN({sn_val}), .CK({dff.ck}), .D({dff.d}), .Q({dff.q})"
         lines.append(f"  dff    {inst_name:<20} ({ports});")
 
     lines.append("")

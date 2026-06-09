@@ -6,6 +6,8 @@ import copy
 import itertools
 import re
 import signal
+import subprocess
+import tempfile
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -93,8 +95,9 @@ class EDAEngine:
             for inp in node.inputs:
                 fanout.setdefault(inp, []).append(inst_name)
         for inst_name, dff in self._netlist.dffs.items():  # type: ignore[union-attr]
-            for sig in (dff.clk, dff.rst_n, dff.d):
-                fanout.setdefault(sig, []).append(inst_name)
+            for sig in (dff.ck, dff.rn, dff.sn, dff.d):
+                if sig:
+                    fanout.setdefault(sig, []).append(inst_name)
         return fanout
 
     def _resolve_signal(self, name: str) -> str:
@@ -563,26 +566,83 @@ class EDAEngine:
             if d not in nl.dffs:
                 raise ValueError(f"DFF instance {d!r} not found in netlist.")
 
-        return nl.dffs[dff1].clk == nl.dffs[dff2].clk
+        return nl.dffs[dff1].ck == nl.dffs[dff2].ck
 
-    def check_equivalence(self, output: str, snapshot_label: str = "default") -> bool:
-        """Check functional equivalence between current netlist and a snapshot.
+    def check_equivalence(self, sig1: str, sig2: str) -> bool:
+        """Check if two signals in the current netlist are functionally equivalent.
 
-        Performs a truth-table comparison for small cones (≤ 20 inputs).
-        Returns True if both netlists produce identical logic for *output*.
+        Uses Yosys SAT solver to verify equivalence.
+        Returns True if both signals produce identical logic for all inputs.
 
         Args:
-            output:         The output signal to compare.
-            snapshot_label: Label of the saved snapshot to compare against.
+            sig1: First signal name to compare.
+            sig2: Second signal name to compare.
         """
         self._require_netlist()
-        if snapshot_label not in self._snapshots:
-            raise ValueError(f"No snapshot with label {snapshot_label!r}")
+        nl = self._netlist
 
-        current = self._netlist
-        reference = self._snapshots[snapshot_label]
+        # Write netlist to temporary file
+        tf = tempfile.NamedTemporaryFile("w", suffix=".v", delete=False)
+        netlist_path = tf.name
+        tf.close()
+        write_verilog(nl, netlist_path)
 
-        return _truth_table_equiv(current, reference, output)
+        try:
+            return self._yosys_check_signals_equiv(netlist_path, sig1, sig2)
+        finally:
+            import os
+            try:
+                os.unlink(netlist_path)
+            except OSError:
+                pass
+
+    def _yosys_check_signals_equiv(
+        self, netlist_verilog: str, sig1: str, sig2: str
+    ) -> bool:
+        """Use Yosys SAT to check if two signals are equivalent.
+        
+        Returns True if signals are equivalent, False otherwise.
+        """
+
+        def check_sat(v1, v2):
+            """Check if the constraint sig1={v1} AND sig2={v2} is satisfiable."""
+            script = f"""
+read_verilog {netlist_verilog}
+prep
+sat -set {sig1} {v1} -set {sig2} {v2}
+"""
+
+            with tempfile.NamedTemporaryFile("w", suffix=".ys", delete=False) as f:
+                f.write(script)
+                f.flush()
+                script_path = f.name
+
+            try:
+                result = subprocess.run(
+                    ["yosys", "-s", script_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+
+                combined = (result.stdout or "") + "\n" + (result.stderr or "")
+                # If model found, SAT is satisfiable
+                return "model found" in combined.lower() or "sat solving finished - model found" in combined.lower()
+            finally:
+                import os
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass
+
+        # Test both scenarios:
+        # sat01: sig1=0 AND sig2=1 (both different and contradictory)
+        # sat10: sig1=1 AND sig2=0 (both different and contradictory)
+        sat01 = check_sat(0, 1)
+        sat10 = check_sat(1, 0)
+
+        # Signals are equivalent if neither contradictory scenario is satisfiable
+        return not sat01 and not sat10
 
     def find_instances_by_name_pattern(
         self, gate_type: str, name_pattern: str
@@ -810,10 +870,12 @@ class EDAEngine:
                         dff = nl.dffs[consumer_inst]
                         if dff.d == cur_net:
                             dff.d = new_wire
-                        if dff.clk == cur_net:
-                            dff.clk = new_wire
-                        if dff.rst_n == cur_net:
-                            dff.rst_n = new_wire
+                        if dff.ck == cur_net:
+                            dff.ck = new_wire
+                        if dff.rn == cur_net:
+                            dff.rn = new_wire
+                        if dff.sn == cur_net:
+                            dff.sn = new_wire
                 # New buffer net may still have high fanout — queue it
                 nets_to_process.append(new_wire)
 
@@ -884,8 +946,12 @@ class EDAEngine:
         needed_signals: Set[str] = set(nl.primary_outputs)
         for dff in nl.dffs.values():
             needed_signals.add(dff.d)
-            needed_signals.add(dff.clk)
-            needed_signals.add(dff.rst_n)
+            if dff.ck:
+                needed_signals.add(dff.ck)
+            if dff.rn:
+                needed_signals.add(dff.rn)
+            if dff.sn:
+                needed_signals.add(dff.sn)
 
         # Backward BFS: find all gate outputs that transitively feed needed signals
         useful_outputs: Set[str] = set()
@@ -922,7 +988,14 @@ class EDAEngine:
             used_wires.add(node.output)
             used_wires |= set(node.inputs)
         for dff in nl.dffs.values():
-            used_wires.update({dff.clk, dff.rst_n, dff.d, dff.q})
+            extra = {dff.d, dff.q}
+            if dff.ck:
+                extra.add(dff.ck)
+            if dff.rn:
+                extra.add(dff.rn)
+            if dff.sn:
+                extra.add(dff.sn)
+            used_wires.update(extra)
 
         declared = set(nl.primary_inputs) | set(nl.primary_outputs)
         nl.wires = {
@@ -1136,113 +1209,3 @@ def _build_balanced_tree(
     elif len(layer) == 1:
         reuse_node.gate_type = "buf"
         reuse_node.inputs = [layer[0]]
-
-
-# ===========================================================================
-# Truth-table equivalence checker (≤ 20 primary inputs)
-# ===========================================================================
-
-def _truth_table_equiv(nl_a: Netlist, nl_b: Netlist, output: str) -> bool:
-    """Return True if both netlists produce the same logic for output.
-
-    Only works for cones with ≤ 20 primary inputs.
-    """
-    inputs_a = _cone_primary_inputs(nl_a, output)
-    inputs_b = _cone_primary_inputs(nl_b, output)
-    all_inputs = sorted(set(inputs_a) | set(inputs_b))
-
-    if len(all_inputs) > 20:
-        # Too large for exhaustive check; assume equivalent
-        return True
-
-    for combo in itertools.product([False, True], repeat=len(all_inputs)):
-        assignment = dict(zip(all_inputs, combo))
-        val_a = _eval_signal(nl_a, output, assignment)
-        val_b = _eval_signal(nl_b, output, assignment)
-        if val_a != val_b:
-            return False
-    return True
-
-
-def _cone_primary_inputs(nl: Netlist, output: str) -> List[str]:
-    """Return primary inputs in the transitive fanin of output."""
-    out2gate: Dict[str, str] = {}
-    for inst, node in nl.nodes.items():
-        out2gate[node.output] = inst
-    for inst, dff in nl.dffs.items():
-        out2gate[dff.q] = inst
-
-    pis: List[str] = []
-    visited: Set[str] = set()
-    queue: deque[str] = deque([output])
-    while queue:
-        sig = queue.popleft()
-        if sig in visited:
-            continue
-        visited.add(sig)
-        if sig in nl.primary_inputs:
-            pis.append(sig)
-            continue
-        driver = out2gate.get(sig)
-        if driver and driver in nl.nodes:
-            for inp in nl.nodes[driver].inputs:
-                queue.append(inp)
-    return pis
-
-
-def _eval_signal(
-    nl: Netlist, signal: str, assignment: Dict[str, bool]
-) -> bool:
-    """Recursively evaluate signal given a primary-input assignment."""
-    if signal in assignment:
-        return assignment[signal]
-    if signal == "1'b1":
-        return True
-    if signal == "1'b0":
-        return False
-
-    out2gate: Dict[str, str] = {n.output: inst for inst, n in nl.nodes.items()}
-
-    cache: Dict[str, bool] = {}
-
-    def _eval(sig: str) -> bool:
-        if sig in cache:
-            return cache[sig]
-        if sig in assignment:
-            return assignment[sig]
-        if sig == "1'b1":
-            return True
-        if sig == "1'b0":
-            return False
-
-        driver = out2gate.get(sig)
-        if driver is None:
-            return False  # unknown signal
-
-        node = nl.nodes[driver]
-        in_vals = [_eval(i) for i in node.inputs]
-
-        gt = node.gate_type
-        if gt == "buf":
-            result = in_vals[0]
-        elif gt == "not":
-            result = not in_vals[0]
-        elif gt == "and":
-            result = in_vals[0] and in_vals[1]
-        elif gt == "or":
-            result = in_vals[0] or in_vals[1]
-        elif gt == "nand":
-            result = not (in_vals[0] and in_vals[1])
-        elif gt == "nor":
-            result = not (in_vals[0] or in_vals[1])
-        elif gt == "xor":
-            result = in_vals[0] ^ in_vals[1]
-        elif gt == "xnor":
-            result = not (in_vals[0] ^ in_vals[1])
-        else:
-            result = False
-
-        cache[sig] = result
-        return result
-
-    return _eval(signal)

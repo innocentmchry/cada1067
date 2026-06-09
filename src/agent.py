@@ -530,7 +530,7 @@ class EDAAgent:
             return {"instances": instances, "count": len(instances)}
 
         if tool_name == "check_equivalence":
-            equiv = eng.check_equivalence(args["output"])
+            equiv = eng.check_equivalence(args["sig1"], args["sig2"])
             return {"equivalent": equiv}
 
         raise ValueError(f"Unknown tool: {tool_name!r}")

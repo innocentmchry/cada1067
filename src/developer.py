@@ -89,7 +89,7 @@ def format_netlist(netlist: Any) -> str:
     dffs = getattr(netlist, "dffs", {})
     lines.append(f"dffs           : {len(dffs)} entries")
     for name, d in sorted(dffs.items()):
-        lines.append(f"  {name}: DFFNode(clk={d.clk}, rst_n={d.rst_n}, d={d.d}, q={d.q})")
+        lines.append(f"  {name}: DFFNode(ck={d.ck}, rn={d.rn}, sn={d.sn}, d={d.d}, q={d.q})")
 
     return "\n".join(lines)
     return "\n".join(lines)
