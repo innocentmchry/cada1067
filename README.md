@@ -39,15 +39,18 @@ create a .env file with content OPENAI_API_KEY="sk-..."
 
 ## Running the tests
 
-Download the testcase from ICCAD contest page
-Initially create an examples folder for analysing single test case
+Download the testcase from ICCAD contest page and place it in the root directory
+
+Initially use examples folder for analysing single testcases
 
 
 ```bash
 bash run.sh examples
 ```
 
-For running all testcases use the following command. (Don't run it always because llm api tokens are limited, Run only once and analyse the results one by one by putting it inside examples folder)
+The script creates an output folder named examples_output which contains the log files of the folder examples
+
+For running all testcases use the following command after downloading the testcase. (Don't run it always because llm api tokens are limited, Run only once and analyse the results one by one by putting it inside examples folder)
 
 ```
 bash run.sh testcase
@@ -57,7 +60,7 @@ bash run.sh testcase
 The script runs testcases and checks that the corresponding
 `.log` files are created.
 
-The script creates an output folder named examples_output which contains the log files of the folder names examples
+The script creates an output folder named testcase_output which contains the log files of the folder testcase
 
 ---
 
@@ -92,7 +95,7 @@ Testcase name has been set to 'test8'. Log file: test8.log
 #END 1
 
 #RESPONSE 2
-Design loaded from 'design/netlist/test8.v'.
+Design loaded from 'examples/test8/test8.v'.
 #END 2
 
 #RESPONSE 3
@@ -101,8 +104,6 @@ Path: in0 → n_in0_n → n1 → n2 → n3 → out3
 #END 3
 ```
 
-Responses are also mirrored to `<case_name>.log` once the testcase name
-is set (via the `set_testcase_name` tool call triggered by the first request).
 
 ---
 
@@ -159,11 +160,9 @@ cada1067_alpha/
 │   ├── netlist_parser.py   ← Verilog parser / writer
 │   ├── io_handler.py       ← stdin/stdout/log handler
 │   └── tools.py            ← OpenAI tool schemas
-├── design/
-│   └── netlist/
-│       ├── test8.v
-│       └── test35.v
+├── logs                    ← human readable framework input and output logs for analysis (developer mode only)
 └── examples/
-    ├── test8_stdin.txt
-    └── test35_stdin.txt
+    └── test1/
+        ├── prompts.txt
+        └── test1.v
 ```
