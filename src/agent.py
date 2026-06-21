@@ -197,6 +197,11 @@ class EDAAgent:
                 f"{data.get('output')} = "
                 f"{data.get('depth')}"
             )
+        elif tool_name == "count_paths":
+            return (
+                f"count_paths: "
+                f"{data.get('count')} paths"
+            )
         elif tool_name == "find_all_paths":
             return (
                 f"find_all_paths: "
@@ -204,10 +209,29 @@ class EDAAgent:
                 f"from {data.get('source')} "
                 f"to {data.get('sink')}"
             )
-        elif tool_name == "find_instances_by_name_pattern":
-            count = data.get("count", 0)
-            instances = data.get("instances", [])
-            return f"find_instances_by_name_pattern: found {count} instances ({', '.join(instances[:5])}{'...' if count > 5 else ''})"
+        elif tool_name == "find_all_paths":
+
+            output_file = data.get(
+                "output_file"
+            )
+
+            if output_file:
+
+                return (
+                    f"find_all_paths: "
+                    f"{data.get('count')} paths "
+                    f"from {data.get('source')} "
+                    f"to {data.get('sink')}. "
+                    f"Full results written to "
+                    f"{output_file}"
+                )
+
+            return (
+                f"find_all_paths: "
+                f"{data.get('count')} paths "
+                f"from {data.get('source')} "
+                f"to {data.get('sink')}"
+            )
         elif tool_name == "replace_gate":
             return f"replace_gate: {data.get('replaced')} → {data.get('new_type')}"
         elif tool_name == "replace_pattern":
@@ -442,6 +466,9 @@ class EDAAgent:
             if self._io_handler is not None:
                 self._io_handler.set_log_file(log_path)
             self._current_case_name = case_name
+            self._engine.set_output_directory(
+                out_dir
+            )
             return f"Testcase name set to {case_name!r}; log file: {log_path!r}"
 
         if tool_name == "get_max_depth":
@@ -463,7 +490,11 @@ class EDAAgent:
                 args["source"], args["sink"], args["avoid"]
             )
             return {"path": path}
-
+        if tool_name == "count_paths":
+            return self._engine.count_paths(
+                args["source"],
+                args["sink"]
+            )
         if tool_name == "get_logic_cone":
             cone = eng.get_logic_cone(args["output_signal"])
             return {"gates": cone, "count": len(cone)}

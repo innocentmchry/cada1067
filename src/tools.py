@@ -227,6 +227,32 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "count_paths",
+            "description": (
+                "Count the total number of combinational "
+                "paths between a source and sink signal "
+                "without enumerating them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string"
+                    },
+                    "sink": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "source",
+                    "sink"
+                ]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_all_paths",
             "description": (
                 "List all combinational paths "

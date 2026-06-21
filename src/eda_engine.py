@@ -6,8 +6,11 @@ import copy
 import itertools
 import re
 import signal
+import sys
+import os
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
+
 
 from .netlist_parser import (
     GateNode,
@@ -37,6 +40,7 @@ class EDAEngine:
         self._netlist: Optional[Netlist] = None
         self._snapshots: Dict[str, Netlist] = {}
         self._instance_counter: int = 0
+        self._output_dir = "."
 
     # ------------------------------------------------------------------
     # Netlist lifecycle
@@ -73,6 +77,19 @@ class EDAEngine:
         if self._netlist is None:
             raise ValueError("No netlist loaded. Call read_design first.")
 
+    def set_output_directory(
+        self,
+        path: str,
+    ):
+
+        import os
+
+        os.makedirs(
+            path,
+            exist_ok=True,
+        )
+
+        self._output_dir = path
     # ------------------------------------------------------------------
     # Internal graph helpers
     # ------------------------------------------------------------------
@@ -457,14 +474,73 @@ class EDAEngine:
                 queue.append(prev)
 
         return reachable
+    
+    def count_paths(
+        self,
+        source: str,
+        sink: str,
+    ) -> int:
+
+        self._require_netlist()
+
+        sink_reachable = self._nodes_reaching_sink(sink)
+
+        memo = {}
+
+        def dfs(node):
+
+            if node == sink:
+                return 1
+
+            if node in memo:
+                return memo[node]
+
+            total = 0
+
+            for nxt in self._forward_successors(node):
+
+                if nxt not in sink_reachable:
+                    continue
+
+                total += dfs(nxt)
+
+            memo[node] = total
+
+            return total
+
+        return {
+            "source": source,
+            "sink": sink,
+            "count": dfs(source)
+        }
+
     def find_all_paths(
         self,
         source: str,
         sink: str,
-        max_paths: int = 500
+        max_paths: int = 1000
     ):
 
-        self._require_netlist()
+        path_count = self.count_paths(
+            source,
+            sink,
+        )["count"]
+
+        MAX_ENUMERATION = 1000
+
+        if path_count > MAX_ENUMERATION:
+
+            return {
+                "source": source,
+                "sink": sink,
+                "count": path_count,
+                "enumerated": False,
+                "message": (
+                    f"Too many paths "
+                    f"({path_count}) "
+                    f"to enumerate."
+                )
+            }
 
         sink_reachable = self._nodes_reaching_sink(sink)
 
@@ -479,12 +555,68 @@ class EDAEngine:
             sink_reachable=sink_reachable,
         )
 
+        # ----------------------------------------------------------
+        # Large result handling
+        # ----------------------------------------------------------
+
+        output_file = None
+
+        if len(paths) > 100:
+
+            safe_source = (
+                source.replace("[", "_")
+                    .replace("]", "")
+            )
+
+            safe_sink = (
+                sink.replace("[", "_")
+                    .replace("]", "")
+            )
+
+            filename = (
+                f"all_paths_"
+                f"{safe_source}_to_{safe_sink}.txt"
+            )
+
+            output_file = os.path.join(
+                self._output_dir,
+                filename,
+            )
+
+            with open(output_file, "w") as f:
+
+                f.write(
+                    f"All paths from "
+                    f"{source} to {sink}\n\n"
+                )
+
+                for idx, p in enumerate(paths, 1):
+
+                    f.write(
+                        f"Path {idx}:\n"
+                    )
+
+                    f.write(
+                        " -> ".join(p)
+                    )
+
+                    f.write("\n\n")
+
         return {
             "source": source,
             "sink": sink,
             "count": len(paths),
-            "paths": paths,
-            "truncated": len(paths) >= max_paths,
+
+            "paths":
+                paths[:20]
+                if output_file
+                else paths,
+
+            "truncated":
+                len(paths) >= max_paths,
+
+            "output_file":
+                output_file,
         }
     def _dfs_paths(
         self,
