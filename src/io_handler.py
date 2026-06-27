@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import IO, Optional
 
 from .agent import EDAAgent
@@ -19,6 +20,7 @@ class IOHandler:
         self._agent = agent
         self._agent.set_io_handler(self) #bidirectional linkage between IOhandler and agent
         self._log_file: Optional[IO[str]] = None
+        self._log_path: Optional[Path] = None
         self._response_counter: int = 0
 
     # ------------------------------------------------------------------
@@ -26,19 +28,24 @@ class IOHandler:
     # ------------------------------------------------------------------
 
     def set_log_file(self, path: str) -> None:
-        """Open (or create) a log file at *path* for appending.
+        """Open a fresh protocol log at *path* for this process.
 
-        Any previously open log file is closed first.
+        Re-selecting the active path is a no-op so a repeated tool call cannot
+        truncate responses already written by this process.
 
         Args:
             path: File-system path of the log file.
         """
+        log_path = Path(path).resolve()
+        if self._log_file is not None and self._log_path == log_path:
+            return
         if self._log_file is not None:
             try:
                 self._log_file.close()
             except OSError:
                 pass
-        self._log_file = open(path, "a", encoding="utf-8")
+        self._log_file = log_path.open("w", encoding="utf-8")
+        self._log_path = log_path
 
     def run(self) -> None:
         """Main loop: read lines from stdin, invoke the agent, write responses.
@@ -52,27 +59,25 @@ class IOHandler:
         """
         context_summary: str = ""
 
-        for raw_line in sys.stdin:
-            line = raw_line.rstrip("\n")
-            if not line:
-                continue
+        try:
+            for raw_line in sys.stdin:
+                line = raw_line.rstrip("\r\n")
 
-            self._response_counter += 1
-            resp_id = self._response_counter
+                self._response_counter += 1
+                resp_id = self._response_counter
 
-            try:
-                response_text = self._agent.process_request(line, context_summary)
-            except Exception as exc:
-                response_text = f"[ERROR] {exc}"
+                try:
+                    response_text = self._agent.process_request(line, context_summary)
+                except Exception as exc:
+                    response_text = f"[ERROR] {exc}"
 
-            self._emit_response(resp_id, response_text)
+                self._emit_response(resp_id, response_text)
 
-            # Build context for the next request
-            context_summary = self._agent.build_state_summary()
-
-        # Close log on EOF
-        if self._log_file is not None:
-            self._log_file.close()
+                # Build context for the next request
+                context_summary = self._agent.build_state_summary()
+        finally:
+            if self._log_file is not None:
+                self._log_file.close()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -92,9 +97,9 @@ class IOHandler:
             text:    The response body text.
         """
         block = f"#RESPONSE {resp_id}\n{text}\n#END {resp_id}\n"
-        sys.stdout.write(block)
-        sys.stdout.flush()
-
         if self._log_file is not None:
             self._log_file.write(block)
             self._log_file.flush()
+
+        sys.stdout.write(block)
+        sys.stdout.flush()

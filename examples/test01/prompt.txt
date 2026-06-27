@@ -1,3 +1,0 @@
-This is the beginning of a new testcase. The case name is test01.
-Please load the design from the file test01.v located in the directory examples/test01/.
-Please write the current design to the output file test01_out.v.

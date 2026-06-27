@@ -1,94 +1,20 @@
-#!/usr/bin/env python3
-"""cada0001_alpha — LLM-assisted EDA netlist exploration and transformation.
+#!/bin/bash
+set -e
 
-Usage:
-    ./cada0001_alpha -config <config_file_path>
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-Reads natural-language requests from stdin (one per line) and prints
-tagged responses to stdout:
+if [[ -f "$DIR/cad_env/bin/activate" ]]; then
+    source "$DIR/cad_env/bin/activate"
+fi
 
-    #RESPONSE <id>
-    <response text>
-    #END <id>
+export PATH="$DIR:$PATH"
+if [[ -d "$DIR/cad_env/lib" ]]; then
+    export LD_LIBRARY_PATH="$DIR/cad_env/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+if [[ -x "$DIR/yosys" ]]; then
+    export YOSYS_BIN="$DIR/yosys"
+fi
 
-Also mirrors all responses to a <case_name>.log file when the testcase
-name is set via the 'set_testcase_name' tool call.
-"""
+cd "$DIR"
 
-from __future__ import annotations
-
-import argparse
-import os
-import sys
-
-# ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path when run as a script
-# ---------------------------------------------------------------------------
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
-
-
-def _load_config(path: str) -> dict:
-    """Load and return the YAML configuration file.
-
-    Args:
-        path: Path to the YAML config file.
-
-    Returns:
-        Parsed configuration as a dict.
-
-    Raises:
-        SystemExit: If the file cannot be read or is malformed.
-    """
-    try:
-        import yaml  # type: ignore[import]
-    except ImportError:
-        sys.exit(
-            "ERROR: PyYAML is not installed. Run: pip install pyyaml>=6.0"
-        )
-
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            config = yaml.safe_load(fh)
-    except FileNotFoundError:
-        sys.exit(f"ERROR: Config file not found: {path!r}")
-    except Exception as exc:
-        sys.exit(f"ERROR: Could not parse config file {path!r}: {exc}")
-
-    if not isinstance(config, dict):
-        sys.exit(f"ERROR: Config file {path!r} must contain a YAML mapping.")
-
-    return config
-
-
-def main() -> None:
-    """Entry point: parse arguments, build objects, run the I/O loop."""
-    parser = argparse.ArgumentParser(
-        prog="cada0001_alpha",
-        description="LLM-assisted EDA netlist exploration and transformation.",
-    )
-    parser.add_argument(
-        "-config",
-        metavar="<config_file_path>",
-        required=True,
-        help="Path to the YAML configuration file.",
-    )
-    args = parser.parse_args()
-
-    config = _load_config(args.config)
-
-    # Import here so import errors surface cleanly after config is loaded
-    from src.eda_engine import EDAEngine
-    from src.agent import EDAAgent
-    from src.io_handler import IOHandler
-
-    engine = EDAEngine()
-    agent = EDAAgent(config, engine)
-    io_handler = IOHandler(agent)
-
-    io_handler.run()
-
-
-if __name__ == "__main__":
-    main()
+exec python "$DIR/main.py" "$@"

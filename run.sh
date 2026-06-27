@@ -38,7 +38,7 @@ run_test() {
     mkdir -p "$(dirname "$log_file")"
     rm -f "$log_file"
 
-    python3 cada1067_alpha -config config.yaml < "$stdin_file"
+    ./cada1067_alpha -config config.yaml < "$stdin_file"
 
     if [[ -f "$log_file" ]]; then
         echo "[PASS] $name — log file created: $log_file"

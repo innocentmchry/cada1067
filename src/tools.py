@@ -113,12 +113,40 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_max_depth_between_endpoint_classes",
+            "description": (
+                "Compute the maximum combinational logic depth across endpoint CLASSES. "
+                "Invoke this exact tool for requests such as 'from any primary input to any DFF D-pin' "
+                "or 'from any PI to any primary output'. This evaluates all matching endpoints in one "
+                "operation. Do not pass literal strings PI, DFF, or PO to get_max_depth."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_class": {
+                        "type": "string",
+                        "enum": ["PI"],
+                        "description": "Source endpoint class.",
+                    },
+                    "sink_class": {
+                        "type": "string",
+                        "enum": ["DFF_D", "PO"],
+                        "description": "DFF_D means every DFF D-pin; PO means every primary-output bit.",
+                    },
+                },
+                "required": ["source_class", "sink_class"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_max_depth",
             "description": (
-                "Invoke this whitout fail when asked to to find the longest combinational path (maximum logic depth) "
-                "Invoke this whitout fail when asked to calculate critical path depth"
-                "Invoke this whitout fail when asked to"
-                "between a source signal and a sink signal. "
+                "Find the longest combinational path between two CONCRETE signal names. "
+                "Both source and sink must be actual netlist signals such as n0 or n16[2]. "
+                "Never pass endpoint classes such as PI, DFF, DFF_D, or PO here; use "
+                "get_max_depth_between_endpoint_classes for those requests. "
                 "DFF boundaries are treated as cuts. "
                 "Returns the depth (integer) and the list of signals on the longest path."
             ),
@@ -252,10 +280,120 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_fanout",
+            "name": "find_register_to_register_paths",
             "description": (
-                "Call this to find all gate instances that are directly driven by a given net. "
-                "Returns a list of gate instance names."
+                "List ALL register-to-register paths through combinational logic. This exact tool must "
+                "be used for requests such as 'List all register-to-register paths in this design'. "
+                "It traverses from every DFF Q pin to reached DFF D pins and reports the ordered gates. "
+                "Do not use list_signals, get_max_depth, or get_max_depth_between_endpoint_classes. "
+                "Up to 10 paths are returned inline; larger results are written under ./temp/ and the "
+                "result returns the path count and file path. Enumeration has a 100,000-path safety "
+                "limit and returns truncated=true when that limit is reached; this must be disclosed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resolve_name_type",
+            "description": (
+                "Determine whether a provided identifier is a combinational gate instance, DFF instance, "
+                "or signal/wire. Call this first when the wording is ambiguous, then select the matching "
+                "gate-based or net-based fanout/reachability tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Identifier to classify, such as g0 or n16.",
+                    }
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_gate_info",
+            "description": (
+                "Return the exact primitive gate type and every logical pin-to-net connection for a "
+                "combinational gate or DFF instance. Use this tool directly for requests such as "
+                "'What type of gate is g0? Report its gate type and pin connections.' The result "
+                "identifies AND, NAND, NOR, NOT, BUF, OR, XOR, XNOR, or DFF; do not use "
+                "resolve_name_type or a fanout tool for this request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_name": {
+                        "type": "string",
+                        "description": "Combinational gate or DFF instance name, such as g0.",
+                    }
+                },
+                "required": ["gate_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_reachable_gates_from_net",
+            "description": (
+                "Find ALL gates transitively reachable downstream from a SIGNAL or WIRE. "
+                "Use after resolve_name_type identifies the source as a signal. Traversal follows "
+                "combinational fanout, includes reached DFFs, and stops at DFF boundaries. "
+                "For more than 10 gates, the complete list is written under ./temp/."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "net_name": {
+                        "type": "string",
+                        "description": "Signal or bus from which downstream reachability starts.",
+                    }
+                },
+                "required": ["net_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_reachable_gates_from_gate",
+            "description": (
+                "Find ALL gates transitively reachable downstream from the OUTPUT of a gate or DFF instance. "
+                "Use after resolve_name_type identifies the source as a combinational_gate or dff. "
+                "For more than 10 gates, the complete list is written under ./temp/."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_name": {
+                        "type": "string",
+                        "description": "Gate or DFF instance whose output starts the traversal.",
+                    }
+                },
+                "required": ["gate_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_net_fanout",
+            "description": (
+                "Find all gate instances directly driven by a SIGNAL OR WIRE. Use for wording such as "
+                "'fanout of net n0'. Do not pass a gate instance such as g0; use get_gate_output_fanout. "
+                "For 10 or fewer gates, returns the names inline so they must be listed in the response. "
+                "For more than 10 gates, writes the complete list to a text file in the current working "
+                "directory temp folder and returns only the count and file path."
             ),
             "parameters": {
                 "type": "object",
@@ -272,9 +410,11 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_gate_fanout",
+            "name": "get_gate_output_fanout",
             "description": (
-                "Return gates driven by a gate instance."
+                "Find every gate directly connected to the OUTPUT NET of a gate or DFF instance. "
+                "Use this exact tool for wording such as 'gates connected to the output of g0'. "
+                "Do not treat the gate instance name as a signal. Large results are written under ./temp/."
             ),
             "parameters": {
                 "type": "object",
@@ -448,29 +588,47 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "optimize_cone_depth",
+            "name": "collapse_inverter_pairs",
             "description": (
-                "Call this to restructure the logic cone of output_signal so its combinational "
-                "depth is at most max_depth. "
-                "Preserves functional equivalence. "
-                "Returns true if the depth constraint is met, false if it cannot be achieved."
+                "Find every back-to-back inverter pair (NOT followed directly by NOT) "
+                "and collapse the pair into a direct wire connection. Use this exact tool "
+                "when asked to remove double inversions or collapse consecutive inverters. "
+                "Shared fanouts and primary-output/DFF boundary net names are preserved. "
+                "Returns the number of pairs collapsed and gates removed."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "output_signal": {
-                        "type": "string",
-                        "description": "The output net whose cone should be optimised.",
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Maximum allowed combinational depth after optimisation.",
-                    },
-                },
-                "required": ["output_signal", "max_depth"],
+                "properties": {},
+                "required": [],
             },
         },
     },
+    # {
+    #     "type": "function",
+    #     "function": {
+    #         "name": "optimize_cone_depth",
+    #         "description": (
+    #             "Call this to restructure the logic cone of output_signal so its combinational "
+    #             "depth is at most max_depth. "
+    #             "Preserves functional equivalence. "
+    #             "Returns true if the depth constraint is met, false if it cannot be achieved."
+    #         ),
+    #         "parameters": {
+    #             "type": "object",
+    #             "properties": {
+    #                 "output_signal": {
+    #                     "type": "string",
+    #                     "description": "The output net whose cone should be optimised.",
+    #                 },
+    #                 "max_depth": {
+    #                     "type": "integer",
+    #                     "description": "Maximum allowed combinational depth after optimisation.",
+    #                 },
+    #             },
+    #             "required": ["output_signal", "max_depth"],
+    #         },
+    #     },
+    # },
     {
         "type": "function",
         "function": {
@@ -526,9 +684,36 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "check_equivalence",
+            "name": "check_signal_constant",
             "description": (
-                "Call this to verify that two signals in the current netlist are functionally equivalent. "
+                "Prove whether a scalar or complete bus is ALWAYS equal to a constant regardless "
+                "of all primary inputs and DFF-Q boundary values. Invoke this exact tool for prompts "
+                "such as 'is output n16 always 0?', 'is this signal constant?', or 'regardless of "
+                "all inputs'. Do not use check_signal_equivalence for constant-property questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "signal_name": {
+                        "type": "string",
+                        "description": "Scalar signal, bit-select, or complete bus to prove.",
+                    },
+                    "value": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Expected constant, such as 0, 1, 8'b0, '0, or '1.",
+                    },
+                },
+                "required": ["signal_name", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_signal_equivalence",
+            "description": (
+                "Compare TWO SIGNALS inside the current netlist for functional equivalence. "
+                "Use only when the request explicitly names two signals; this does not compare designs. "
                 "Uses Yosys SAT solver for precise equivalence checking on circuits of any size. "
                 "Returns true if the signals are logically equivalent, false otherwise."
             ),
@@ -545,6 +730,258 @@ TOOLS: List[Dict[str, Any]] = [
                     }
                 },
                 "required": ["sig1", "sig2"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_design_equivalence",
+            "description": (
+                "Prove that the CURRENT TRANSFORMED DESIGN is equivalent to the ORIGINAL NETLIST "
+                "loaded by read_design. Invoke this exact non-mutating tool for requests such as "
+                "'prove the transformed design is equivalent to the pre-transformation netlist' "
+                "or 'verify whole-design equivalence'. It serializes the current netlist and runs "
+                "Yosys whole-design sequential equivalence. Never call FRAIG for a proof request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_gate",
+            "description": (
+                "Rename a gate instance in the currently loaded netlist. "
+                "Only the instance name changes — connections and logic are preserved exactly. "
+                "Invoke this when asked to rename, relabel, or change the name of a gate instance."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_name": {
+                        "type": "string",
+                        "description": "Current instance name of the gate to rename.",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "New instance name for the gate.",
+                    },
+                },
+                "required": ["old_name", "new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_wire",
+            "description": (
+                "Rename a wire or signal in the currently loaded netlist and update all references. "
+                "Use this when asked to rename, relabel, or change the identifier of a wire/net. "
+                "Only the signal name changes; gate and DFF connectivity is preserved."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_name": {
+                        "type": "string",
+                        "description": "Current wire/signal name to rename.",
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "New wire/signal name.",
+                    },
+                },
+                "required": ["old_name", "new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_gate_type_in_cone",
+            "description": (
+                "Replace all instances of a specific gate type (e.g. OR) in the fanin cone "
+                "of an output signal with a functionally equivalent circuit built from the target gate types. "
+                "Unlike remap_cone_with_gates, this ONLY touches the specified source gate type — "
+                "all other gates in the cone remain unchanged. "
+                "Use this when asked to 'replace OR gates with NAND+NOT' or 'convert XOR to NAND-only' "
+                "within a cone or across the whole design. "
+                "Set output_signal to null to apply across the entire design. "
+                "Returns success, replaced (count), skipped (count)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_type": {
+                        "type": "string",
+                        "description": "Gate type to replace. E.g. 'or', 'xor', 'nor', 'and', 'not', 'buf'.",
+                    },
+                    "target_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Allowed gate types in the replacement. "
+                            "E.g. ['nand', 'not'] or ['nor', 'not']. "
+                            "Must form a functionally complete set for the source gate."
+                        ),
+                    },
+                    "output_signal": {
+                        "type": "string",
+                        "description": (
+                            "Cone root signal (e.g. 'n11[0]'). "
+                            "Only gates in the fanin cone of this signal are replaced. "
+                            "Omit or set to null to apply across the entire design."
+                        ),
+                    },
+                },
+                "required": ["source_type", "target_types"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fraig_merge_equivalent_gates",
+            "description": (
+                "Use Yosys+ABC FRAIG to find, formally prove, and merge functionally equivalent "
+                "combinational nodes across the whole design. Invoke this exact tool when asked "
+                "to merge functionally equivalent gates or equivalent gate pairs. The ABC flow "
+                "runs FRAIG only; it does not run dc2, dch, balancing, depth optimization, or retiming. "
+                "DFF boundaries and an active whole-design gate restriction are preserved."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remap_design_with_gates",
+            "description": (
+                "Reconstruct the ENTIRE netlist/whole design using only the specified gate types. "
+                "Invoke this exact tool when the request says 'entire netlist', 'whole design', "
+                "or asks to restrict every combinational gate in the design. Do not pass a module "
+                "name to remap_cone_with_gates for whole-design requests. DFFs and their boundary "
+                "nets are preserved. Example: allowed_gates=['and', 'not']."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "allowed_gates": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "The only combinational gate types permitted afterward. "
+                            "Valid values: 'and', 'nand', 'nor', 'or', 'not', "
+                            "'xor', 'xnor', and 'buf'."
+                        ),
+                    },
+                },
+                "required": ["allowed_gates"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remap_cone_with_gates",
+            "description": (
+                "Re-implement the fanin cone of a given output signal using ONLY the specified gate types. "
+                "This is only for a specific driven signal, never an entire module or whole design. "
+                "Uses Yosys+ABC with a restricted Liberty library so the result is guaranteed to use "
+                "only the allowed gates. Handles any source gate type (OR, NOR, XOR, etc.) automatically. "
+                "Use this when asked to replace gates in a cone with a restricted set "
+                "(e.g. 'replace all gates in cone of n11[0] with only NAND and NOT gates'). "
+                "Returns success, gates_before, gates_after."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string",
+                        "description": "The output net whose fanin cone will be remapped (e.g. 'n11[0]').",
+                    },
+                    "allowed_gates": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "List of gate types the cone may use after remapping. "
+                            "Valid values: 'nand', 'nor', 'or', 'not', 'xor', 'xnor', 'buf'. "
+                            "Example: ['nand', 'not']"
+                        ),
+                    },
+                },
+                "required": ["output_signal", "allowed_gates"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_signals",
+            "description": (
+                "Return lists of signal names available in the currently loaded netlist. "
+                "Provides primary inputs, primary outputs, internal wires, gate outputs and DFF signals."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reduce_critical_path",
+            "description": (
+                "Invoke this without fail when asked to reduce, minimize or optimize the critical path depth "
+                "or maximum logic depth of the design. "
+                "Uses Yosys+ABC logic restructuring to reduce combinational depth. "
+                "When the request says the netlist must remain restricted to specific gate types, "
+                "pass those exact types in allowed_gates (for example ['and', 'not']). "
+                "If omitted, a restriction established by remap_design_with_gates is inherited. "
+                "No retiming or sequential changes are made — only combinational logic is restructured. "
+                "Returns depth_before, depth_after, improvement and success."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "allowed_gates": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional exclusive gate set for the optimized result. "
+                            "Use whenever the prompt says the design must remain those gates only."
+                        ),
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "auto_insert_buffers",
+            "description": (
+                "Automatically find nets with fanout > max_fanout and insert buffers so no gate drives more than max_fanout loads. "
+                "If 'nets' is provided (array of net names), only those nets are processed; otherwise all known nets are checked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_fanout": {"type": "integer", "description": "Maximum allowed fanout per net."},
+                    "nets": {"type": "array", "items": {"type": "string"}, "description": "Optional list of net names to process (default: all)."}
+                },
+                "required": ["max_fanout"],
             },
         },
     },

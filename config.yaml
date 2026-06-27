@@ -2,6 +2,9 @@ provider: "openai"
 
 openai:
   model: "gpt-4o-mini"
+  # Optional: uncomment to configure the API key here instead of using
+  # the OPENAI_API_KEY environment variable or .env file.
+  # api_key: "sk-your-api-key-here"
 
 anthropic:
   model: "claude-haiku-4-5"
@@ -11,5 +14,5 @@ generation:
   max_output_tokens: 4096
 
 developer:
-  mode: true
+  mode: false
   log_dir: null   # defaults to <project_root>/logs

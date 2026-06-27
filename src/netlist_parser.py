@@ -301,9 +301,27 @@ def _parse_primitive(
 ) -> None:
     """Add a primitive gate node.
 
-    Verilog primitive port order: output first, then inputs.
+    Supports both positional ports (output first) and named ports (.A/.B/.Y/.ZN)
+    as produced by Yosys+ABC after Liberty-based technology mapping.
     """
-    if gate_type in ONE_INPUT_GATES:
+    # Detect named-port style: any token starting with '.'
+    if any(p.strip().startswith('.') for p in ports):
+        # Build mapping: port_name.lower() -> signal
+        mapping: Dict[str, str] = {}
+        for p in ports:
+            m = re.match(r"\.\s*(\w+)\s*\(\s*(.*?)\s*\)\s*$", p.strip())
+            if not m:
+                raise ParseError(f"Cannot parse named port token: {p!r}")
+            mapping[m.group(1).lower()] = _resolve_port_signal(m.group(2))
+        # Output pin is Y or ZN; inputs are A and B
+        output_port = mapping.get('y') or mapping.get('zn', '')
+        if not output_port:
+            raise ParseError(f"Gate {inst_name!r}: cannot find output pin (Y/ZN) in {mapping}")
+        if gate_type in ONE_INPUT_GATES:
+            input_ports = [mapping.get('a', '')]
+        else:
+            input_ports = [mapping.get('a', ''), mapping.get('b', '')]
+    elif gate_type in ONE_INPUT_GATES:
         if len(ports) != 2:
             raise ParseError(
                 f"Gate {inst_name!r} ({gate_type}) expects 2 ports "

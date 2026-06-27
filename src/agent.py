@@ -50,9 +50,13 @@ _SYSTEM_PROMPT = (
     "and transformation tools. When the user gives a natural-language request about "
     "a gate-level Verilog netlist, call the appropriate tool(s) in the correct order. "
     "After all tool calls are complete, return a concise, clear natural-language answer "
-    "describing what was found or what was changed. Do not discuss scoring or evaluation."
-    "For any numerical/statistical query about the design."
-    "you MUST use tools instead of estimating from memory or summaries."
+    "describing what was found or what was changed. Do not discuss scoring or evaluation. "
+    "User prompts arrive sequentially. If the current request asks for a result or fact "
+    "already recorded in the ordered context history, answer directly from that history "
+    "without calling another tool. Call tools only when the needed fact is absent from "
+    "history or the user explicitly requests recomputation or current-state analysis. "
+    "For numerical or statistical design queries whose answer is not already explicit in "
+    "the ordered context history, use tools instead of estimating."
 )
 
 # Timeouts (seconds) per category
@@ -118,11 +122,13 @@ class EDAAgent:
                 "openai package is not installed. Run: pip install openai>=1.0.0"
             ) from exc
 
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            api_key = str(config.get("openai", {}).get("api_key", "")).strip()
         if not api_key or api_key.startswith("YOUR_"):
             raise RuntimeError(
                 "OpenAI API key not configured. "
-                "Set OPENAI_API_KEY in the .env file or export it as an environment variable."
+                "Set OPENAI_API_KEY in the environment/.env file or set openai.api_key in config.yaml."
             )
         return OpenAI(api_key=api_key)
 
@@ -146,6 +152,9 @@ class EDAAgent:
         if self._current_case_name:
             parts.append(f"testcase='{self._current_case_name}'")
 
+        if self._engine.original_netlist_path:
+            parts.append(f"original_netlist='{self._engine.original_netlist_path}'")
+
         try:
             nl = self._engine.netlist
             gate_types: Dict[str, int] = {}
@@ -164,7 +173,7 @@ class EDAAgent:
 
         # Full operation history
         if self._context_history:
-            parts.append("operations so far:")
+            parts.append("operations so far in order:")
             for item in self._context_history:
                 parts.append(f"  - {item}")
 
@@ -189,8 +198,19 @@ class EDAAgent:
             return f"wrote design via write_design"
         elif tool_name == "set_testcase_name":
             return f"testcase initialized via set_testcase_name"
+        elif tool_name == "count_gates":
+            total = data.get("total_gates", "?")
+            breakdown = data.get("breakdown", {})
+            parts = ", ".join(f"{cnt}x {gt}" for gt, cnt in sorted(breakdown.items()) if cnt > 0)
+            return f"count_gates: {total} total gates ({parts})"
         elif tool_name == "get_max_depth":
             return f"get_max_depth: depth={data.get('depth')}"
+        elif tool_name == "get_max_depth_between_endpoint_classes":
+            return (
+                f"get_max_depth_between_endpoint_classes: "
+                f"{data.get('source_class')} to {data.get('sink_class')} "
+                f"depth={data.get('depth')}"
+            )
         elif tool_name == "get_fanin_cone_depth":
             return (
                 f"fanin cone depth of "
@@ -204,10 +224,41 @@ class EDAAgent:
                 f"from {data.get('source')} "
                 f"to {data.get('sink')}"
             )
+        elif tool_name == "find_register_to_register_paths":
+            summary = f"find_register_to_register_paths: {data.get('count', 0)} paths"
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            if data.get("truncated"):
+                summary += "; result truncated at safety limit"
+            return summary
+        elif tool_name in {"get_net_fanout", "get_gate_output_fanout"}:
+            count = data.get("count", 0)
+            if data.get("file_path"):
+                return f"{tool_name}: {count} direct gates; full list in {data['file_path']}"
+            return f"{tool_name}: {count} direct gates ({', '.join(data.get('fanout', []))})"
+        elif tool_name == "resolve_name_type":
+            return f"resolve_name_type: {data.get('name')} is {data.get('type')}"
+        elif tool_name == "get_gate_info":
+            pins = ", ".join(
+                f"{pin}={net}" for pin, net in data.get("pins", {}).items()
+            )
+            return (
+                f"get_gate_info: {data.get('instance')} is {data.get('gate_type')} "
+                f"({pins})"
+            )
+        elif tool_name in {"get_reachable_gates_from_net", "get_reachable_gates_from_gate"}:
+            count = data.get("count", 0)
+            if data.get("file_path"):
+                return f"{tool_name}: {count} reachable gates; full list in {data['file_path']}"
+            return f"{tool_name}: {count} reachable gates ({', '.join(data.get('gates', []))})"
         elif tool_name == "find_instances_by_name_pattern":
             count = data.get("count", 0)
             instances = data.get("instances", [])
             return f"find_instances_by_name_pattern: found {count} instances ({', '.join(instances[:5])}{'...' if count > 5 else ''})"
+        elif tool_name == "rename_gate":
+            return f"rename_gate: '{data.get('old_name')}' → '{data.get('new_name')}'"
+        elif tool_name == "rename_wire":
+            return f"rename_wire: '{data.get('old_name')}' → '{data.get('new_name')}'"
         elif tool_name == "replace_gate":
             return f"replace_gate: {data.get('replaced')} → {data.get('new_type')}"
         elif tool_name == "replace_pattern":
@@ -218,8 +269,75 @@ class EDAAgent:
             return f"balance_depth: {data.get('buffers_inserted', 0)} buffers"
         elif tool_name == "remove_dangling_gates":
             return f"remove_dangling_gates: {data.get('gates_removed', 0)} gates removed"
+        elif tool_name == "collapse_inverter_pairs":
+            return (
+                f"collapse_inverter_pairs: {data.get('pairs_collapsed', 0)} pairs collapsed, "
+                f"{data.get('gates_removed', 0)} gates removed"
+            )
+        elif tool_name == "replace_gate_type_in_cone":
+            ok = data.get("success", False)
+            if ok:
+                replaced = data.get("replaced", 0)
+                skipped  = data.get("skipped", 0)
+                src   = data.get("source_type", "?")
+                tgt   = data.get("target_types", [])
+                scope = data.get("output_signal") or "whole design"
+                return (
+                    f"replace_gate_type_in_cone: replaced {replaced}x '{src}' with {tgt} "
+                    f"in cone of {scope}" +
+                    (f" ({skipped} skipped)" if skipped else "")
+                )
+            else:
+                return f"replace_gate_type_in_cone: FAILED — {data.get('reason', 'unknown error')}"
+        elif tool_name == "remap_cone_with_gates":
+            ok = data.get("success", False)
+            if ok:
+                before = data.get("gates_before", "?")
+                after  = data.get("gates_after", "?")
+                sig    = data.get("output_signal", "?")
+                gates  = data.get("allowed_gates", [])
+                return f"remap_cone_with_gates: cone of {sig} remapped to {gates} — {before} gates → {after} gates"
+            else:
+                return f"remap_cone_with_gates: FAILED — {data.get('reason', 'unknown error')}"
+        elif tool_name == "remap_design_with_gates":
+            if data.get("success", False):
+                return (
+                    f"remap_design_with_gates: whole design remapped to "
+                    f"{data.get('allowed_gates', [])} — "
+                    f"{data.get('gates_before', '?')} gates → {data.get('gates_after', '?')} gates"
+                )
+            return f"remap_design_with_gates: FAILED — {data.get('reason', 'unknown error')}"
+        elif tool_name == "fraig_merge_equivalent_gates":
+            if data.get("success", False):
+                return (
+                    f"fraig_merge_equivalent_gates: "
+                    f"{data.get('gates_before', '?')} gates → {data.get('gates_after', '?')} gates "
+                    f"(reduction {data.get('gate_reduction', '?')})"
+                )
+            return f"fraig_merge_equivalent_gates: FAILED"
+        elif tool_name == "check_signal_equivalence":
+            return f"check_signal_equivalence: equivalent={data.get('equivalent')}"
+        elif tool_name == "check_signal_constant":
+            answer = "yes" if data.get("always_equal") else "no"
+            return (
+                f"check_signal_constant: {data.get('signal')} always equals "
+                f"{data.get('value')} = {answer}"
+            )
+        elif tool_name == "check_design_equivalence":
+            return (
+                f"check_design_equivalence: {data.get('status', 'UNKNOWN')} "
+                f"against {data.get('original_netlist', 'original design')}"
+            )
         elif tool_name == "optimize_cone_depth":
             return f"optimize_cone_depth: {'OK' if data.get('success') else 'FAILED'}"
+        elif tool_name == "reduce_critical_path":
+            before = data.get('depth_before', '?')
+            after = data.get('depth_after', '?')
+            imp = data.get('improvement', '?')
+            ok = data.get('success', False)
+            restriction = data.get('allowed_gates')
+            restricted = f" using only {restriction}" if restriction else ""
+            return f"reduce_critical_path: depth {before} → {after} (improved by {imp}){restricted} {'OK' if ok else 'NO IMPROVEMENT'}"
         else:
             return f"{tool_name} completed"
 
@@ -261,7 +379,7 @@ class EDAAgent:
             EDAAgent._request_counter, self._logs_dir, self._model, label=label
         ) as conv_log:
             conv_log.log_user_input(user_message)
-            if context_summary:
+            if context_summary and self._developer_mode:
                 conv_log._fh.write(
                     f"  ── CONTEXT ──\n  {context_summary}\n  ─────────────\n\n"
                 )
@@ -415,7 +533,7 @@ class EDAAgent:
 
         if tool_name == "read_design":
             eng.load(args["filepath"])
-            return f"Design loaded from {args['filepath']!r}"
+            return f"Design loaded from {eng.original_netlist_path!r}"
 
         if tool_name == "write_design":
             filepath: str = args["filepath"]
@@ -434,11 +552,7 @@ class EDAAgent:
 
         if tool_name == "set_testcase_name":
             case_name: str = args["case_name"]
-            # Place logs inside <OUTPUT_DIR>/<case_name>/
-            out_base = os.environ.get("OUTPUT_DIR", "testcase_output")
-            out_dir = os.path.join(out_base, case_name)
-            os.makedirs(out_dir, exist_ok=True)
-            log_path: str = os.path.join(out_dir, args.get("log_path") or f"{case_name}.log")
+            log_path: str = args["log_path"]
             if self._io_handler is not None:
                 self._io_handler.set_log_file(log_path)
             self._current_case_name = case_name
@@ -447,6 +561,11 @@ class EDAAgent:
         if tool_name == "get_max_depth":
             depth, path = eng.get_max_depth(args["source"], args["sink"])
             return {"depth": depth, "path": path}
+
+        if tool_name == "get_max_depth_between_endpoint_classes":
+            return eng.get_max_depth_between_endpoint_classes(
+                args["source_class"], args["sink_class"]
+            )
 
         if tool_name == "get_fanin_cone_depth":
             return eng.get_fanin_cone_depth(
@@ -476,13 +595,22 @@ class EDAAgent:
                 args["source"],
                 args["sink"]
             )
-        if tool_name == "get_fanout":
-            fanout = eng.get_fanout(args["net_name"])
-            return {"fanout": fanout, "count": len(fanout)}
-        if tool_name == "get_gate_fanout":
-            return eng.get_gate_fanout(
-                args["gate_name"]
-            )
+        if tool_name == "find_register_to_register_paths":
+            return eng.find_register_to_register_paths()
+        if tool_name == "resolve_name_type":
+            return eng.resolve_name_type(args["name"])
+        if tool_name == "get_gate_info":
+            return eng.get_gate_info(args["gate_name"])
+        if tool_name == "get_net_fanout":
+            return eng.get_fanout_report(args["net_name"])
+        if tool_name == "get_reachable_gates_from_net":
+            return eng.get_reachable_gates_from_net(args["net_name"])
+        if tool_name == "get_reachable_gates_from_gate":
+            return eng.get_reachable_gates_from_gate(args["gate_name"])
+        if tool_name == "list_signals":
+            return eng.list_signals()
+        if tool_name == "get_gate_output_fanout":
+            return eng.get_gate_fanout_report(args["gate_name"])
         if tool_name == "are_same_clock_domain":
             same = eng.are_same_clock_domain(args["dff1"], args["dff2"])
             return {"same_clock_domain": same}
@@ -492,6 +620,14 @@ class EDAAgent:
                 args["target_instance"], args["gate_type"], args["extra_input"]
             )
             return {"new_instance": new_inst}
+
+        if tool_name == "rename_gate":
+            eng.rename_gate(args["old_name"], args["new_name"])
+            return {"old_name": args["old_name"], "new_name": args["new_name"]}
+
+        if tool_name == "rename_wire":
+            eng.rename_wire(args["old_name"], args["new_name"])
+            return {"old_name": args["old_name"], "new_name": args["new_name"]}
 
         if tool_name == "replace_gate":
             eng.replace_gate(
@@ -505,6 +641,32 @@ class EDAAgent:
             n = eng.insert_buffers_for_fanout(args["net_name"], args["max_fanout"])
             return {"buffers_inserted": n}
 
+        if tool_name == "auto_insert_buffers":
+            max_fanout = int(args.get("max_fanout", 4))
+            nets = args.get("nets")
+            processed = []
+            per_net = {}
+            total = 0
+
+            if not nets:
+                sigs = eng.list_signals()
+                # Candidate nets: wires + gate_outputs + dff_q + dff_d
+                nets = list(sigs.get("wires", [])) + list(sigs.get("gate_outputs", [])) + list(sigs.get("dff_q", [])) + list(sigs.get("dff_d", []))
+
+            for net in nets:
+                try:
+                    fanout = eng.get_fanout(net)
+                except Exception:
+                    fanout = []
+                cnt = len(fanout)
+                if cnt > max_fanout:
+                    inserted = eng.insert_buffers_for_fanout(net, max_fanout)
+                    per_net[net] = {"before": cnt, "buffers_inserted": inserted}
+                    total += inserted
+                    processed.append(net)
+
+            return {"nets_processed": len(processed), "buffers_inserted": total, "per_net": per_net}
+
         if tool_name == "balance_depth":
             n = eng.balance_depth(args["source"], args["sinks"])
             return {"buffers_inserted": n}
@@ -512,6 +674,31 @@ class EDAAgent:
         if tool_name == "remove_dangling_gates":
             n = eng.remove_dangling_gates()
             return {"gates_removed": n}
+
+        if tool_name == "collapse_inverter_pairs":
+            return eng.collapse_inverter_pairs()
+
+        if tool_name == "reduce_critical_path":
+            return eng.reduce_critical_path(args.get("allowed_gates"))
+
+        if tool_name == "replace_gate_type_in_cone":
+            return eng.replace_gate_type_in_cone(
+                args["source_type"],
+                args["target_types"],
+                args.get("output_signal"),
+            )
+
+        if tool_name == "remap_cone_with_gates":
+            return eng.remap_cone_with_gates(
+                args["output_signal"],
+                args["allowed_gates"],
+            )
+
+        if tool_name == "remap_design_with_gates":
+            return eng.remap_design_with_gates(args["allowed_gates"])
+
+        if tool_name == "fraig_merge_equivalent_gates":
+            return eng.fraig_merge_equivalent_gates()
 
         if tool_name == "optimize_cone_depth":
             success = eng.optimize_cone_depth(
@@ -529,8 +716,14 @@ class EDAAgent:
             )
             return {"instances": instances, "count": len(instances)}
 
-        if tool_name == "check_equivalence":
-            equiv = eng.check_equivalence(args["sig1"], args["sig2"])
+        if tool_name == "check_signal_equivalence":
+            equiv = eng.check_signal_equivalence(args["sig1"], args["sig2"])
             return {"equivalent": equiv}
+
+        if tool_name == "check_signal_constant":
+            return eng.check_signal_constant(args["signal_name"], args["value"])
+
+        if tool_name == "check_design_equivalence":
+            return eng.check_design_equivalence()
 
         raise ValueError(f"Unknown tool: {tool_name!r}")

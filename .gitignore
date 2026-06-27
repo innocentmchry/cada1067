@@ -1,9 +1,14 @@
 .env
-logs/
+logs*/
 A_release testcase_0510/
 examples_output/
+temp/
 testcase*/
 my_examples*
 # Python cache files
 __pycache__/
 *.py[cod]
+test*
+_tmp*
+docs/
+src/__pycache__/
