@@ -1,7 +1,4 @@
 test_name,status,message,log_path
-test21,PASS,"Equivalence proven",log/test21_equiv.log
-test25,PASS,"Equivalence proven",log/test25_equiv.log
-test26,PASS,"Equivalence proven",log/test26_equiv.log
-test27,PASS,"Equivalence proven",log/test27_equiv.log
-test29,PASS,"Equivalence proven",log/test29_equiv.log
-test30,PASS,"Equivalence proven",log/test30_equiv.log
+test29,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test29_equiv.log
+test30,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test30_equiv.log
+test31,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test31_equiv.log

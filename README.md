@@ -48,7 +48,7 @@ Initially use examples folder for analysing single testcases
 bash run.sh examples
 ```
 
-The script creates an output folder named examples_output which contains the log files of the folder examples
+Logs and generated Verilog files are written in the current directory.
 
 For running all testcases use the following command after downloading the testcase. (Don't run it always because llm api tokens are limited, Run only once and analyse the results one by one by putting it inside examples folder)
 
@@ -56,7 +56,7 @@ For running all testcases use the following command after downloading the testca
 bash run.sh testcase
 ```
 
-The script creates an output folder named testcase_output which contains the log files of the folder testcase
+Logs and generated Verilog files are written in the current directory.
 
 ---
 

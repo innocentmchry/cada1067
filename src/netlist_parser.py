@@ -353,6 +353,13 @@ def _parse_primitive(
 # Writer
 # ---------------------------------------------------------------------------
 
+def _format_verilog_signal(name: str) -> str:
+    """Return a signal name formatted safely for Verilog output."""
+    if name.startswith("\\") and not name.endswith((" ", "\t", "\n", "\r")):
+        return f"{name} "
+    return name
+
+
 def write_verilog(netlist: Netlist, filepath: str) -> None:
     """Write a Netlist back to a gate-level Verilog file.
 
@@ -367,7 +374,7 @@ def write_verilog(netlist: Netlist, filepath: str) -> None:
     lines.append(f"module {netlist.module_name} (")
     port_decls = []
     for p in all_ports:
-        port_decls.append(f"  {p}")
+        port_decls.append(f"  {_format_verilog_signal(p)}")
     lines.append(",\n".join(port_decls))
     lines.append(");")
     lines.append("")
@@ -376,16 +383,16 @@ def write_verilog(netlist: Netlist, filepath: str) -> None:
     for name in netlist.primary_inputs:
         wi = netlist.wires.get(name)
         if wi and wi.is_bus:
-            lines.append(f"  input wire [{wi.msb}:{wi.lsb}] {name};")
+            lines.append(f"  input wire [{wi.msb}:{wi.lsb}] {_format_verilog_signal(name)};")
         else:
-            lines.append(f"  input wire {name};")
+            lines.append(f"  input wire {_format_verilog_signal(name)};")
 
     for name in netlist.primary_outputs:
         wi = netlist.wires.get(name)
         if wi and wi.is_bus:
-            lines.append(f"  output wire [{wi.msb}:{wi.lsb}] {name};")
+            lines.append(f"  output wire [{wi.msb}:{wi.lsb}] {_format_verilog_signal(name)};")
         else:
-            lines.append(f"  output wire {name};")
+            lines.append(f"  output wire {_format_verilog_signal(name)};")
 
     lines.append("")
 
@@ -397,24 +404,39 @@ def write_verilog(netlist: Netlist, filepath: str) -> None:
     if internal_wires:
         for name, wi in internal_wires:
             if wi.is_bus:
-                lines.append(f"  wire [{wi.msb}:{wi.lsb}] {name};")
+                lines.append(f"  wire [{wi.msb}:{wi.lsb}] {_format_verilog_signal(name)};")
             else:
-                lines.append(f"  wire {name};")
+                lines.append(f"  wire {_format_verilog_signal(name)};")
         lines.append("")
 
     # Gate instances
     for inst_name, node in netlist.nodes.items():
+        inst = _format_verilog_signal(inst_name)
         if node.gate_type in ONE_INPUT_GATES:
-            ports = f"{node.output}, {node.inputs[0]}"
+            ports = (
+                f"{_format_verilog_signal(node.output)}, "
+                f"{_format_verilog_signal(node.inputs[0])}"
+            )
         else:
-            ports = f"{node.output}, {node.inputs[0]}, {node.inputs[1]}"
-        lines.append(f"  {node.gate_type:<6} {inst_name:<20} ({ports});")
+            ports = (
+                f"{_format_verilog_signal(node.output)}, "
+                f"{_format_verilog_signal(node.inputs[0])}, "
+                f"{_format_verilog_signal(node.inputs[1])}"
+            )
+        lines.append(f"  {node.gate_type:<6} {inst:<20} ({ports});")
 
     # DFF instances (written using named-port syntax)
     for inst_name, dff in netlist.dffs.items():
+        inst = _format_verilog_signal(inst_name)
         sn_val = dff.sn if dff.sn else "1'b1"
-        ports = f".RN({dff.rn}), .SN({sn_val}), .CK({dff.ck}), .D({dff.d}), .Q({dff.q})"
-        lines.append(f"  dff    {inst_name:<20} ({ports});")
+        ports = (
+            f".RN({_format_verilog_signal(dff.rn)}), "
+            f".SN({_format_verilog_signal(sn_val)}), "
+            f".CK({_format_verilog_signal(dff.ck)}), "
+            f".D({_format_verilog_signal(dff.d)}), "
+            f".Q({_format_verilog_signal(dff.q)})"
+        )
+        lines.append(f"  dff    {inst:<20} ({ports});")
 
     lines.append("")
     lines.append("endmodule")

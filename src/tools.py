@@ -33,17 +33,21 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "write_design",
             "description": (
                 "Call this to write the current (possibly modified) netlist back to a "
-                "Verilog file on disk. Use after any transformation to persist changes."
+                "Verilog file on disk. Use after any transformation to persist changes. "
+                "If filepath is omitted, write '<case_name>_out.v' in the current working "
+                "directory, or 'design_out.v' if no testcase name is set."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filepath": {
                         "type": "string",
-                        "description": "Destination path for the output Verilog file.",
+                        "description": (
+                            "Optional destination path for the output Verilog file. "
+                            "Relative paths are saved relative to the current working directory."
+                        ),
                     }
                 },
-                "required": ["filepath"],
             },
         },
     },
@@ -70,7 +74,8 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "set_testcase_name",
             "description": (
                 "Call this when the user specifies a testcase name (e.g., 'test8', 'test35'). "
-                "Sets the active case name and opens the corresponding log file for output mirroring."
+                "Sets the active case name and opens the corresponding log file for output mirroring. "
+                "If log_path is omitted, use '<case_name>.log' in the current working directory."
             ),
             "parameters": {
                 "type": "object",
@@ -82,12 +87,12 @@ TOOLS: List[Dict[str, Any]] = [
                     "log_path": {
                         "type": "string",
                         "description": (
-                            "Path to the log file (e.g. 'test8.log'). "
-                            "Defaults to '<case_name>.log' in the current directory."
+                            "Optional path to the log file (e.g. 'test8.log'). "
+                            "Relative paths are saved relative to the current working directory."
                         ),
                     },
                 },
-                "required": ["case_name", "log_path"],
+                "required": ["case_name"],
             },
         },
     },
@@ -108,6 +113,38 @@ TOOLS: List[Dict[str, Any]] = [
                 },
                 "required": ["output_signal"]
             }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_outputs_by_logic_depth",
+            "description": (
+                "Count how many primary-output bits have combinational fanin logic depth "
+                "matching a comparison predicate. Use this exact tool for prompts such as "
+                "'How many outputs have a logic depth greater than 4?', 'less than 3', "
+                "'equal to 0', 'at least 5', or 'at most 2'. Bus outputs are expanded "
+                "and counted per output bit. DFF boundaries are treated as cuts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operator": {
+                        "type": "string",
+                        "enum": [">", ">=", "<", "<=", "==", "!="],
+                        "description": (
+                            "Comparison operator. Map natural language as: greater than => >, "
+                            "at least => >=, less/smaller than => <, at most => <=, "
+                            "equal to/exactly => ==, not equal to => !=."
+                        ),
+                    },
+                    "threshold": {
+                        "type": "integer",
+                        "description": "Depth threshold to compare against.",
+                    },
+                },
+                "required": ["operator", "threshold"],
+            },
         },
     },
     {
@@ -257,8 +294,12 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "find_all_paths",
             "description": (
-                "List all combinational paths "
-                "between a source signal and sink signal."
+                "List all combinational paths between a source signal and sink signal. "
+                "Only the first 5 paths are returned inline by default. If more than "
+                "5 paths exist, the complete path list is written to a text file under "
+                "./_tmp/ and the result returns the file_path. There is no artificial "
+                "maximum path-count cap; enumeration continues until all acyclic "
+                "combinational paths are found."
             ),
             "parameters": {
                 "type": "object",
@@ -268,6 +309,13 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                     "sink": {
                         "type": "string"
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": (
+                            "Optional number of paths to include inline in the tool result. "
+                            "Defaults to 5. Do not increase this unless explicitly requested."
+                        )
                     }
                 },
                 "required": [
@@ -286,7 +334,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "be used for requests such as 'List all register-to-register paths in this design'. "
                 "It traverses from every DFF Q pin to reached DFF D pins and reports the ordered gates. "
                 "Do not use list_signals, get_max_depth, or get_max_depth_between_endpoint_classes. "
-                "Up to 10 paths are returned inline; larger results are written under ./temp/ and the "
+                "Up to 10 paths are returned inline; larger results are written under ./_tmp/ and the "
                 "result returns the path count and file path. Enumeration has a 100,000-path safety "
                 "limit and returns truncated=true when that limit is reached; this must be disclosed."
             ),
@@ -349,7 +397,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "Find ALL gates transitively reachable downstream from a SIGNAL or WIRE. "
                 "Use after resolve_name_type identifies the source as a signal. Traversal follows "
                 "combinational fanout, includes reached DFFs, and stops at DFF boundaries. "
-                "For more than 10 gates, the complete list is written under ./temp/."
+                "For more than 10 gates, the complete list is written under ./_tmp/."
             ),
             "parameters": {
                 "type": "object",
@@ -370,7 +418,7 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Find ALL gates transitively reachable downstream from the OUTPUT of a gate or DFF instance. "
                 "Use after resolve_name_type identifies the source as a combinational_gate or dff. "
-                "For more than 10 gates, the complete list is written under ./temp/."
+                "For more than 10 gates, the complete list is written under ./_tmp/."
             ),
             "parameters": {
                 "type": "object",
@@ -414,7 +462,7 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Find every gate directly connected to the OUTPUT NET of a gate or DFF instance. "
                 "Use this exact tool for wording such as 'gates connected to the output of g0'. "
-                "Do not treat the gate instance name as a signal. Large results are written under ./temp/."
+                "Do not treat the gate instance name as a signal. Large results are written under ./_tmp/."
             ),
             "parameters": {
                 "type": "object",
@@ -519,10 +567,37 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "insert_dedicated_buffers_for_loads",
+            "description": (
+                "Call this when the request says each direct load of a signal/net must be "
+                "driven through its own dedicated BUF gate. This inserts one BUF per "
+                "current direct load, reconnects every original load to a unique buffer "
+                "output, and leaves the original net driving only the inserted buffers. "
+                "Use this for wording like 'each load of n2 is driven through a dedicated "
+                "buffer'. Do not use insert_buffers_for_fanout for that wording."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "net_name": {
+                        "type": "string",
+                        "description": "The signal/net whose current direct loads should each get a dedicated BUF.",
+                    },
+                },
+                "required": ["net_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "insert_buffers_for_fanout",
             "description": (
                 "Call this to insert buffer trees on a net so that no downstream gate "
                 "has fanout exceeding max_fanout. "
+                "This may leave some loads directly connected to the original net. "
+                "Do not use this when every load needs its own dedicated buffer; use "
+                "insert_dedicated_buffers_for_loads instead. "
                 "Returns the number of buffers inserted."
             ),
             "parameters": {

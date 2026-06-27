@@ -145,7 +145,7 @@ class EDAAgent:
         previous operations for this testcase.
 
         The IOHandler calls this after each request to feed context into
-        the next request.  Includes: testcase name, loaded design, and
+        the next request. Includes testcase name, original netlist path, and
         the full history of operations performed so far.
         """
         parts: List[str] = []
@@ -154,22 +154,6 @@ class EDAAgent:
 
         if self._engine.original_netlist_path:
             parts.append(f"original_netlist='{self._engine.original_netlist_path}'")
-
-        try:
-            nl = self._engine.netlist
-            gate_types: Dict[str, int] = {}
-            for g in nl.nodes.values():
-                gate_types[g.gate_type] = gate_types.get(g.gate_type, 0) + 1
-            type_summary = ", ".join(
-                f"{cnt}x {gt}" for gt, cnt in sorted(gate_types.items())
-            )
-            parts.append(
-                f"design: '{nl.module_name}' "
-                f"({type_summary}; {len(nl.dffs)} DFFs; "
-                f"{len(nl.primary_inputs)} PIs, {len(nl.primary_outputs)} POs)"
-            )
-        except (ValueError, AttributeError):
-            pass  # no design loaded yet
 
         # Full operation history
         if self._context_history:
@@ -217,13 +201,22 @@ class EDAAgent:
                 f"{data.get('output')} = "
                 f"{data.get('depth')}"
             )
-        elif tool_name == "find_all_paths":
+        elif tool_name == "count_outputs_by_logic_depth":
             return (
+                f"count_outputs_by_logic_depth: "
+                f"{data.get('count')} outputs "
+                f"{data.get('operator')} {data.get('threshold')}"
+            )
+        elif tool_name == "find_all_paths":
+            summary = (
                 f"find_all_paths: "
                 f"{data.get('count')} paths "
                 f"from {data.get('source')} "
                 f"to {data.get('sink')}"
             )
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            return summary
         elif tool_name == "find_register_to_register_paths":
             summary = f"find_register_to_register_paths: {data.get('count', 0)} paths"
             if data.get("file_path"):
@@ -265,6 +258,11 @@ class EDAAgent:
             return f"replace_pattern: {data.get('replacements', 0)} replacements"
         elif tool_name == "insert_buffers_for_fanout":
             return f"insert_buffers_for_fanout: {data.get('buffers_inserted', 0)} buffers"
+        elif tool_name == "insert_dedicated_buffers_for_loads":
+            return (
+                f"insert_dedicated_buffers_for_loads: "
+                f"{data.get('buffers_inserted', 0)} buffers on {data.get('net_name')}"
+            )
         elif tool_name == "balance_depth":
             return f"balance_depth: {data.get('buffers_inserted', 0)} buffers"
         elif tool_name == "remove_dangling_gates":
@@ -536,13 +534,10 @@ class EDAAgent:
             return f"Design loaded from {eng.original_netlist_path!r}"
 
         if tool_name == "write_design":
-            filepath: str = args["filepath"]
-            # If a testcase name is set, redirect output to <OUTPUT_DIR>/<name>/
-            if self._current_case_name:
-                out_base = os.environ.get("OUTPUT_DIR", "testcase_output")
-                out_dir = os.path.join(out_base, self._current_case_name)
-                os.makedirs(out_dir, exist_ok=True)
-                filepath = os.path.join(out_dir, os.path.basename(filepath))
+            filepath = str(args.get("filepath") or "").strip()
+            if not filepath:
+                base_name = self._current_case_name or "design"
+                filepath = f"{base_name}_out.v"
             eng.save(filepath)
             return f"Design written to {filepath!r}"
 
@@ -552,7 +547,9 @@ class EDAAgent:
 
         if tool_name == "set_testcase_name":
             case_name: str = args["case_name"]
-            log_path: str = args["log_path"]
+            log_path: str = str(args.get("log_path") or "").strip()
+            if not log_path:
+                log_path = f"{case_name}.log"
             if self._io_handler is not None:
                 self._io_handler.set_log_file(log_path)
             self._current_case_name = case_name
@@ -570,6 +567,11 @@ class EDAAgent:
         if tool_name == "get_fanin_cone_depth":
             return eng.get_fanin_cone_depth(
                 args["output_signal"]
+            )
+        if tool_name == "count_outputs_by_logic_depth":
+            return eng.count_outputs_by_logic_depth(
+                args["operator"],
+                int(args["threshold"])
             )
         if tool_name == "path_passes_through":
             result = eng.path_passes_through(
@@ -593,7 +595,8 @@ class EDAAgent:
         if tool_name == "find_all_paths":
             return eng.find_all_paths(
                 args["source"],
-                args["sink"]
+                args["sink"],
+                args.get("inline_limit") or 5,
             )
         if tool_name == "find_register_to_register_paths":
             return eng.find_register_to_register_paths()
@@ -640,6 +643,10 @@ class EDAAgent:
         if tool_name == "insert_buffers_for_fanout":
             n = eng.insert_buffers_for_fanout(args["net_name"], args["max_fanout"])
             return {"buffers_inserted": n}
+
+        if tool_name == "insert_dedicated_buffers_for_loads":
+            n = eng.insert_dedicated_buffers_for_loads(args["net_name"])
+            return {"net_name": args["net_name"], "buffers_inserted": n}
 
         if tool_name == "auto_insert_buffers":
             max_fanout = int(args.get("max_fanout", 4))

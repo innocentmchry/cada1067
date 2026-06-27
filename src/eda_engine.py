@@ -37,7 +37,7 @@ _SUBSTITUTION_TEMPLATE_CACHE: Dict[Tuple, dict] = {}
 
 def _workspace_temp_dir() -> str:
     """Return the writable temporary root inside the current working directory."""
-    root = os.path.abspath(os.path.join(os.getcwd(), "temp"))
+    root = os.path.abspath(os.path.join(os.getcwd(), "_tmp"))
     os.makedirs(root, exist_ok=True)
     return root
 
@@ -184,9 +184,11 @@ class EDAEngine:
         self._allowed_gates_constraint = None
         return self._netlist
 
-    def save(self, filepath: str) -> None:
+    def save(self, filepath: Optional[str] = None) -> None:
         """Write the current netlist back to a Verilog file."""
         self._require_netlist()
+        if not filepath:
+            filepath = "design_out.v"
         write_verilog(self._netlist, filepath)
 
     def add_snapshot(self, label: str = "default") -> None:
@@ -396,6 +398,50 @@ class EDAEngine:
         return {
             "output": output_signal,
             "depth": self._fanin_depth(output_signal)
+        }
+
+    def count_outputs_by_logic_depth(self, operator: str, threshold: int) -> dict:
+        """Count primary-output bits whose combinational fanin depth matches a predicate."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        comparators = {
+            ">": lambda depth: depth > threshold,
+            ">=": lambda depth: depth >= threshold,
+            "<": lambda depth: depth < threshold,
+            "<=": lambda depth: depth <= threshold,
+            "==": lambda depth: depth == threshold,
+            "!=": lambda depth: depth != threshold,
+        }
+        if operator not in comparators:
+            raise ValueError(
+                "operator must be one of: >, >=, <, <=, ==, !="
+            )
+
+        output_bits: List[str] = []
+        for output_name in nl.primary_outputs:
+            wire = nl.wires.get(output_name)
+            if wire and wire.is_bus:
+                lo = min(wire.msb, wire.lsb)
+                hi = max(wire.msb, wire.lsb)
+                output_bits.extend(f"{output_name}[{bit}]" for bit in range(lo, hi + 1))
+            else:
+                output_bits.append(output_name)
+
+        memo: Dict[str, int] = {}
+        depths = [
+            {"output": output_name, "depth": self._fanin_depth(output_name, memo)}
+            for output_name in output_bits
+        ]
+        matching = [entry for entry in depths if comparators[operator](entry["depth"])]
+
+        return {
+            "operator": operator,
+            "threshold": threshold,
+            "count": len(matching),
+            "outputs": matching,
+            "total_outputs": len(output_bits),
         }
         
     def get_max_depth(
@@ -714,31 +760,97 @@ class EDAEngine:
         self,
         source: str,
         sink: str,
-        max_paths: int = 500
+        inline_limit: int = 5,
     ):
+        """Find all combinational signal paths from source to sink.
 
+        The first ``inline_limit`` paths are returned in the tool result. If
+        more paths exist, the complete list is streamed to a text file under
+        the workspace temp directory instead of being returned as JSON.
+        """
         self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        inline_limit = max(0, int(inline_limit))
+        self._resolve_signal(source)
+        self._resolve_signal(sink)
 
-        sink_reachable = self._nodes_reaching_sink(sink)
+        out2gate = self._build_output_to_gate()
+        fanout_successors: Dict[str, List[str]] = {}
+        for node in nl.nodes.values():
+            for input_signal in node.inputs:
+                fanout_successors.setdefault(input_signal, []).append(node.output)
 
-        paths = []
+        sink_reachable: Set[str] = set()
+        queue: deque[str] = deque([sink])
+        while queue:
+            signal_name = queue.popleft()
+            if signal_name in sink_reachable:
+                continue
+            sink_reachable.add(signal_name)
+            driver_name = out2gate.get(signal_name)
+            if driver_name and driver_name in nl.nodes:
+                queue.extend(nl.nodes[driver_name].inputs)
 
-        self._dfs_paths(
-            current=source,
-            sink=sink,
-            path=[source],
-            paths=paths,
-            max_paths=max_paths,
-            sink_reachable=sink_reachable,
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="all_paths_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
         )
+        report_path = os.path.abspath(report.name)
+        inline_paths: List[List[str]] = []
+        count = 0
+        path: List[str] = [source]
+        visited: Set[str] = {source}
 
-        return {
+        def record_path() -> None:
+            nonlocal count
+            count += 1
+            current_path = list(path)
+            if count <= inline_limit:
+                inline_paths.append(current_path)
+            report.write(f"{count}. {' -> '.join(current_path)}\n")
+
+        def walk(signal_name: str) -> None:
+            if signal_name == sink:
+                record_path()
+                return
+
+            for next_signal in fanout_successors.get(signal_name, []):
+                if next_signal not in sink_reachable or next_signal in visited:
+                    continue
+                visited.add(next_signal)
+                path.append(next_signal)
+                walk(next_signal)
+                path.pop()
+                visited.remove(next_signal)
+
+        try:
+            if source in sink_reachable:
+                walk(source)
+        finally:
+            report.close()
+
+        file_path: Optional[str] = None
+        if count > inline_limit:
+            file_path = report_path
+        else:
+            try:
+                os.unlink(report_path)
+            except OSError:
+                pass
+
+        result = {
             "source": source,
             "sink": sink,
-            "count": len(paths),
-            "paths": paths,
-            "truncated": len(paths) >= max_paths,
+            "count": count,
+            "paths": inline_paths,
         }
+        if file_path:
+            result["file_path"] = file_path
+        return result
 
     def find_register_to_register_paths(
         self,
@@ -868,47 +980,6 @@ class EDAEngine:
         else:
             result["file_path"] = report_path
         return result
-
-    def _dfs_paths(
-        self,
-        current: str,
-        sink: str,
-        path: list[str],
-        paths: list[list[str]],
-        max_paths: int,
-        sink_reachable: Set[str],
-    ):
-
-        if len(paths) >= max_paths:
-            return
-
-        if current == sink:
-            paths.append(path.copy())
-            return
-
-        for nxt in self._forward_successors(current):
-
-            # prune impossible branches
-            if nxt not in sink_reachable:
-                continue
-
-            # avoid cycles
-            if nxt in path:
-                continue
-
-            path.append(nxt)
-
-            self._dfs_paths(
-                current=nxt,
-                sink=sink,
-                path=path,
-                paths=paths,
-                max_paths=max_paths,
-                sink_reachable=sink_reachable,
-            )
-
-            path.pop()
-            
 
     def get_fanout(self, net_name: str) -> List[str]:
         """Return all gate instance names driven by net_name.
@@ -1270,6 +1341,7 @@ sat {' '.join(constraints)}
                     text=True,
                     timeout=120,
                     env=_temp_subprocess_env(),
+                    cwd=_workspace_temp_dir(),
                 )
 
                 combined = (result.stdout or "") + "\n" + (result.stderr or "")
@@ -1390,6 +1462,7 @@ sat {' '.join(constraints)}
                 text=True,
                 timeout=120,
                 env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
             )
             combined = (result.stdout or "") + "\n" + (result.stderr or "")
             if result.returncode == 0:
@@ -1498,6 +1571,7 @@ sat {' '.join(constraints)}
                     text=True,
                     timeout=300,
                     env=_temp_subprocess_env(),
+                    cwd=_workspace_temp_dir(),
                 )
             except subprocess.TimeoutExpired as exc:
                 with open(log_path, "w") as fh:
@@ -1770,6 +1844,52 @@ sat {' '.join(constraints)}
                 nets_to_process.append(new_wire)
 
         return total_inserted
+
+    def insert_dedicated_buffers_for_loads(self, net_name: str) -> int:
+        """Insert one buffer per current direct load of net_name.
+
+        After this operation, each load that directly consumed net_name before
+        the call consumes a newly created buffer output instead. The original
+        net drives only the inserted buffers.
+        """
+        self._require_netlist()
+        self._resolve_signal(net_name)
+        nl = self._netlist
+        assert nl is not None
+
+        direct_loads = list(self._build_fanout_map().get(net_name, []))
+        inserted = 0
+
+        for consumer_inst in direct_loads:
+            if consumer_inst not in nl.nodes and consumer_inst not in nl.dffs:
+                continue
+
+            new_wire = self._next_wire_name("dedbuf_w")
+            buf_inst = self._next_inst_name("dedbuf_g")
+            self._add_wire(new_wire)
+            nl.nodes[buf_inst] = GateNode(
+                name=buf_inst,
+                gate_type="buf",
+                inputs=[net_name],
+                output=new_wire,
+            )
+
+            if consumer_inst in nl.nodes:
+                node = nl.nodes[consumer_inst]
+                node.inputs = [new_wire if sig == net_name else sig for sig in node.inputs]
+            elif consumer_inst in nl.dffs:
+                dff = nl.dffs[consumer_inst]
+                if dff.d == net_name:
+                    dff.d = new_wire
+                if dff.ck == net_name:
+                    dff.ck = new_wire
+                if dff.rn == net_name:
+                    dff.rn = new_wire
+                if dff.sn == net_name:
+                    dff.sn = new_wire
+            inserted += 1
+
+        return inserted
 
     def balance_depth(self, source: str, sinks: List[str]) -> int:
         """Add buffers to equalise path lengths from source to all sinks.
@@ -2272,6 +2392,7 @@ sat {' '.join(constraints)}
                 text=True,
                 timeout=300,
                 env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -2670,6 +2791,7 @@ sat {' '.join(constraints)}
                 [_yosys_binary(), "-s", script_f],
                 capture_output=True, text=True, timeout=300,
                 env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
             )
         except FileNotFoundError:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2942,6 +3064,7 @@ sat {' '.join(constraints)}
                 text=True,
                 timeout=300,
                 env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
             )
             if result.returncode != 0 or not os.path.exists(output_v):
                 raise RuntimeError(
@@ -3130,6 +3253,7 @@ sat {' '.join(constraints)}
             text=True,
             timeout=30,
             env=process_env,
+            cwd=_workspace_temp_dir(),
         )
         if result.returncode != 0 or not os.path.exists(out_blif):
             shutil.rmtree(tmp_dir, ignore_errors=True)
