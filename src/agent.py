@@ -56,7 +56,15 @@ _SYSTEM_PROMPT = (
     "without calling another tool. Call tools only when the needed fact is absent from "
     "history or the user explicitly requests recomputation or current-state analysis. "
     "For numerical or statistical design queries whose answer is not already explicit in "
-    "the ordered context history, use tools instead of estimating."
+    "the ordered context history, use tools instead of estimating. Tool results may be "
+    "compacted to save tokens; when a result includes a count and file_path, report the "
+    "count and file path instead of requesting the full inline list. For constant "
+    "propagation of gates with tied constant inputs, or prompts referring to reported "
+    "gates, use find_gates results and replace_gate with explicit new_inputs for only "
+    "those instances. If the relevant prior find_gates summary says zero gates were "
+    "found, report that there is nothing to simplify. Do not use replace_gate_type_in_cone "
+    "for constant propagation or reported-gate simplification; it is only for intentional "
+    "gate-library remapping of all gates of a type in a scope."
 )
 
 # Timeouts (seconds) per category
@@ -108,6 +116,17 @@ class EDAAgent:
         self._temperature: float = float(gen.get("temperature", 0.2))
         self._max_tokens: int = int(gen.get("max_output_tokens", 4096))
 
+        safety = config.get("safety", {})
+        self._max_tool_rounds: int = int(safety.get("max_tool_rounds", 4))
+        self._max_inline_items: int = int(safety.get("max_inline_items", 10))
+        self._max_tool_result_chars: int = int(
+            safety.get("max_tool_result_chars", 2000)
+        )
+        self._context_history_limit: int = int(
+            safety.get("context_history_limit", 20)
+        )
+        self._active_user_message: str = ""
+
     # ------------------------------------------------------------------
     # Client construction
     # ------------------------------------------------------------------
@@ -156,15 +175,123 @@ class EDAAgent:
             parts.append(f"original_netlist='{self._engine.original_netlist_path}'")
 
         # Full operation history
-        if self._context_history:
+        history = self._context_history[-self._context_history_limit:]
+        if history:
             parts.append("operations so far in order:")
-            for item in self._context_history:
+            if len(self._context_history) > len(history):
+                omitted = len(self._context_history) - len(history)
+                parts.append(f"  - ... {omitted} earlier operations omitted")
+            for item in history:
                 parts.append(f"  - {item}")
 
         return "\n".join(parts) if parts else "(no state)"
 
+    def _trim_context_history(self) -> None:
+        """Keep only the most recent compact operation summaries."""
+        if self._context_history_limit <= 0:
+            self._context_history = []
+            return
+        overflow = len(self._context_history) - self._context_history_limit
+        if overflow > 0:
+            del self._context_history[:overflow]
+
+    def _append_context_summary(self, summary: str) -> None:
+        """Append an operation summary, merging consecutive replacement counts."""
+        if summary.startswith("replace_gate: ") and self._context_history:
+            last = self._context_history[-1]
+            if last.startswith("replace_gate: "):
+                merged = self._merge_replace_gate_summaries(last, summary)
+                if merged:
+                    self._context_history[-1] = merged
+                    self._trim_context_history()
+                    return
+        self._context_history.append(summary)
+        self._trim_context_history()
+
     @staticmethod
-    def _summarize_tool_result(tool_name: str, result_str: str) -> str:
+    def _parse_replace_gate_summary(summary: str) -> Optional[tuple[int, str]]:
+        prefix = "replace_gate: "
+        if not summary.startswith(prefix):
+            return None
+        body = summary[len(prefix):]
+        marker = " gate(s) -> "
+        if marker not in body:
+            return None
+        count_text, new_type = body.split(marker, 1)
+        try:
+            return int(count_text), new_type.strip()
+        except ValueError:
+            return None
+
+    def _merge_replace_gate_summaries(self, first: str, second: str) -> Optional[str]:
+        first_parsed = self._parse_replace_gate_summary(first)
+        second_parsed = self._parse_replace_gate_summary(second)
+        if not first_parsed or not second_parsed:
+            return None
+        first_count, first_type = first_parsed
+        second_count, second_type = second_parsed
+        if first_type != second_type:
+            return None
+        return f"replace_gate: {first_count + second_count} gate(s) -> {first_type}"
+
+    def _compact_tool_result_for_llm(self, result_str: str) -> str:
+        """Shrink a tool result before feeding it back to the LLM."""
+        try:
+            payload = json.loads(result_str)
+        except json.JSONDecodeError:
+            return self._truncate_text(result_str)
+
+        compacted = self._compact_value(payload)
+        compacted_str = json.dumps(compacted)
+        if len(compacted_str) <= self._max_tool_result_chars:
+            return compacted_str
+        tail_limit = max(200, self._max_tool_result_chars - 500)
+        return json.dumps(
+            {
+                "result_summary": "Tool result was compacted because it exceeded the inline character limit.",
+                "inline_char_limit": self._max_tool_result_chars,
+                "compacted_result_chars": len(compacted_str),
+                "tail": compacted_str[-tail_limit:],
+            }
+        )
+
+    def _compact_value(self, value: Any) -> Any:
+        """Recursively cap large lists and strings in JSON-like data."""
+        if isinstance(value, dict):
+            return {k: self._compact_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            if len(value) <= self._max_inline_items:
+                return [self._compact_value(v) for v in value]
+            return {
+                "inline_items": [
+                    self._compact_value(v) for v in value[: self._max_inline_items]
+                ],
+                "omitted_items": len(value) - self._max_inline_items,
+                "total_items": len(value),
+            }
+        if isinstance(value, str):
+            return self._truncate_text(value)
+        return value
+
+    def _truncate_text(self, text: str) -> str:
+        if len(text) <= self._max_tool_result_chars:
+            return text
+        return (
+            f"[truncated to last {self._max_tool_result_chars} chars]\n"
+            + text[-self._max_tool_result_chars :]
+        )
+
+    @staticmethod
+    def _tool_call_signature(tool_name: str, arguments_json: str) -> str:
+        """Return a stable key for detecting repeated identical tool calls."""
+        try:
+            args = json.loads(arguments_json) if arguments_json else {}
+            canonical_args = json.dumps(args, sort_keys=True, separators=(",", ":"))
+        except json.JSONDecodeError:
+            canonical_args = arguments_json or ""
+        return f"{tool_name}:{canonical_args}"
+
+    def _summarize_tool_result(self, tool_name: str, result_str: str) -> str:
         """Create a one-line summary of a tool result for context tracking."""
         try:
             result = json.loads(result_str)
@@ -172,7 +299,7 @@ class EDAAgent:
             return f"{tool_name} completed"
 
         if "error" in result:
-            return f"{tool_name} FAILED: {result['error']}"
+            return f"{tool_name} FAILED: {self._truncate_text(str(result['error']))}"
 
         data = result.get("result", result)
 
@@ -187,6 +314,46 @@ class EDAAgent:
             breakdown = data.get("breakdown", {})
             parts = ", ".join(f"{cnt}x {gt}" for gt, cnt in sorted(breakdown.items()) if cnt > 0)
             return f"count_gates: {total} total gates ({parts})"
+        elif tool_name == "count_primary_ios":
+            return (
+                f"count_primary_ios: "
+                f"{data.get('primary_input_ports')} PI ports, "
+                f"{data.get('primary_output_ports')} PO ports"
+            )
+        elif tool_name == "find_gates":
+            count = data.get("count", 0)
+            gate_type = data.get("gate_type")
+            input_count = data.get("input_count")
+            has_input = data.get("has_input")
+            gate_desc = (
+                f"{input_count}-input {str(gate_type).upper()} gates"
+                if input_count
+                else f"{str(gate_type).upper()} gates"
+            )
+            if gate_type == "any":
+                gate_desc = (
+                    f"{input_count}-input gates" if input_count else "gates"
+                )
+            input_desc = ""
+            if has_input in {"1'b1", "1", "'1"}:
+                input_desc = " with input tied to constant 1"
+            elif has_input in {"1'b0", "0", "'0"}:
+                input_desc = " with input tied to constant 0"
+            elif has_input:
+                input_desc = f" with input {has_input}"
+
+            summary = f"find_gates: found {count} {gate_desc}{input_desc}"
+            matches = data.get("matches") or data.get("sample_matches") or []
+            sample_names = [
+                item.get("instance")
+                for item in matches[:5]
+                if isinstance(item, dict) and item.get("instance")
+            ]
+            if sample_names:
+                summary += f": {', '.join(sample_names)}"
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            return summary
         elif tool_name == "get_max_depth":
             return f"get_max_depth: depth={data.get('depth')}"
         elif tool_name == "get_max_depth_between_endpoint_classes":
@@ -194,6 +361,20 @@ class EDAAgent:
                 f"get_max_depth_between_endpoint_classes: "
                 f"{data.get('source_class')} to {data.get('sink_class')} "
                 f"depth={data.get('depth')}"
+            )
+        elif tool_name == "path_passes_through":
+            answer = "YES" if data.get("all_paths_pass_through") else "NO"
+            path_state = "path exists" if data.get("path_exists") else "no path exists"
+            return (
+                f"path_passes_through: {answer} for "
+                f"{data.get('source')}->{data.get('sink')} via "
+                f"{data.get('through')} ({path_state})"
+            )
+        elif tool_name == "is_gate_on_any_max_depth_path":
+            return (
+                f"is_gate_on_any_max_depth_path: {data.get('gate')} "
+                f"{'YES' if data.get('on_any_max_depth_path') else 'NO'} "
+                f"(global depth {data.get('global_max_depth')})"
             )
         elif tool_name == "get_fanin_cone_depth":
             return (
@@ -231,6 +412,11 @@ class EDAAgent:
             return f"{tool_name}: {count} direct gates ({', '.join(data.get('fanout', []))})"
         elif tool_name == "resolve_name_type":
             return f"resolve_name_type: {data.get('name')} is {data.get('type')}"
+        elif tool_name == "replace_gate":
+            return (
+                f"replace_gate: {data.get('replaced_count', 1)} "
+                f"gate(s) -> {data.get('new_type')}"
+            )
         elif tool_name == "get_gate_info":
             pins = ", ".join(
                 f"{pin}={net}" for pin, net in data.get("pins", {}).items()
@@ -376,6 +562,7 @@ class EDAAgent:
         with self._LoggerCls(
             EDAAgent._request_counter, self._logs_dir, self._model, label=label
         ) as conv_log:
+            self._active_user_message = user_message
             conv_log.log_user_input(user_message)
             if context_summary and self._developer_mode:
                 conv_log._fh.write(
@@ -391,6 +578,8 @@ class EDAAgent:
             messages.append({"role": "user", "content": user_message})
 
             turn = 0
+            tool_rounds = 0
+            seen_tool_calls: set[str] = set()
             while True:
                 turn += 1
                 timeout = _FAST_TIMEOUT  # conservative default
@@ -408,9 +597,33 @@ class EDAAgent:
                 messages.append(msg.model_dump(exclude_unset=False))
 
                 if choice.finish_reason == "tool_calls" and msg.tool_calls:
+                    if tool_rounds >= self._max_tool_rounds:
+                        final_text = (
+                            "Stopped after reaching the per-request tool-call round "
+                            f"limit ({self._max_tool_rounds}) to avoid excessive token use. "
+                            "The last tool result is available in the developer log."
+                        )
+                        conv_log.log_final_response(final_text)
+                        return final_text
+                    tool_rounds += 1
+
                     # Dispatch each tool call
                     for tc in msg.tool_calls:
                         tool_name = tc.function.name
+                        call_signature = self._tool_call_signature(
+                            tool_name, tc.function.arguments
+                        )
+                        if call_signature in seen_tool_calls:
+                            final_text = (
+                                "Stopped after the model repeated the same tool call "
+                                f"({tool_name}) with the same arguments in one request. "
+                                "This guard prevents repeated token spend when a tool "
+                                "result is not resolving the request."
+                            )
+                            conv_log.log_final_response(final_text)
+                            return final_text
+                        seen_tool_calls.add(call_signature)
+
                         op_timeout = (
                             _FAST_TIMEOUT if tool_name in _FAST_OPS else _SLOW_TIMEOUT
                         )
@@ -423,17 +636,20 @@ class EDAAgent:
                         summary = self._summarize_tool_result(
                             tool_name, result_str
                         )
-                        self._context_history.append(summary)
+                        self._append_context_summary(summary)
 
                         # If a design was just loaded, dump the netlist to the log
                         if tool_name == "read_design":
                             conv_log.log_netlist(self._engine.netlist)
 
+                        compact_result_str = self._compact_tool_result_for_llm(
+                            result_str
+                        )
                         messages.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": tc.id,
-                                "content": result_str,
+                                "content": compact_result_str,
                             }
                         )
                 else:
@@ -544,6 +760,9 @@ class EDAAgent:
         if tool_name == "count_gates":
             return eng.count_gates()
 
+        if tool_name == "count_primary_ios":
+            return eng.count_primary_ios()
+
 
         if tool_name == "set_testcase_name":
             case_name: str = args["case_name"]
@@ -564,6 +783,9 @@ class EDAAgent:
                 args["source_class"], args["sink_class"]
             )
 
+        if tool_name == "is_gate_on_any_max_depth_path":
+            return eng.is_gate_on_any_max_depth_path(args["gate_name"])
+
         if tool_name == "get_fanin_cone_depth":
             return eng.get_fanin_cone_depth(
                 args["output_signal"]
@@ -574,10 +796,9 @@ class EDAAgent:
                 int(args["threshold"])
             )
         if tool_name == "path_passes_through":
-            result = eng.path_passes_through(
+            return eng.paths_pass_through_report(
                 args["source"], args["sink"], args["node"]
             )
-            return {"passes_through": result}
 
         if tool_name == "find_path_avoiding":
             path = eng.find_path_avoiding(
@@ -604,6 +825,13 @@ class EDAAgent:
             return eng.resolve_name_type(args["name"])
         if tool_name == "get_gate_info":
             return eng.get_gate_info(args["gate_name"])
+        if tool_name == "find_gates":
+            return eng.find_gates(
+                args.get("gate_type", ""),
+                args.get("input_count"),
+                args.get("has_input"),
+                args.get("inline_limit", 50),
+            )
         if tool_name == "get_net_fanout":
             return eng.get_fanout_report(args["net_name"])
         if tool_name == "get_reachable_gates_from_net":
@@ -633,12 +861,36 @@ class EDAAgent:
             return {"old_name": args["old_name"], "new_name": args["new_name"]}
 
         if tool_name == "replace_gate":
+            replacements = args.get("replacements")
+            if replacements:
+                replaced_instances = []
+                new_types = set()
+                for replacement in replacements:
+                    eng.replace_gate(
+                        replacement["instance_name"],
+                        replacement["new_gate_type"],
+                        replacement.get("extra_input"),
+                        replacement.get("new_inputs"),
+                    )
+                    replaced_instances.append(replacement["instance_name"])
+                    new_types.add(replacement["new_gate_type"])
+                return {
+                    "replaced_count": len(replaced_instances),
+                    "replaced": replaced_instances[:10],
+                    "new_type": ",".join(sorted(new_types)),
+                }
+
             eng.replace_gate(
                 args["instance_name"],
                 args["new_gate_type"],
                 args.get("extra_input"),
+                args.get("new_inputs"),
             )
-            return {"replaced": args["instance_name"], "new_type": args["new_gate_type"]}
+            return {
+                "replaced_count": 1,
+                "replaced": args["instance_name"],
+                "new_type": args["new_gate_type"],
+            }
 
         if tool_name == "insert_buffers_for_fanout":
             n = eng.insert_buffers_for_fanout(args["net_name"], args["max_fanout"])

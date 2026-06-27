@@ -13,6 +13,12 @@ generation:
   temperature: 0.2
   max_output_tokens: 4096
 
+safety:
+  max_tool_turns: 4
+  max_inline_items: 10
+  max_tool_result_chars: 2000
+  context_history_limit: 20
+
 developer:
   mode: true
   log_dir: null   # defaults to <project_root>/logs

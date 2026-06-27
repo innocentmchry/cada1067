@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import os
 import re
 import shutil
@@ -637,6 +638,130 @@ class EDAEngine:
             "path": path,
         }
 
+    def is_gate_on_any_max_depth_path(self, gate_name: str) -> dict:
+        """Return whether a combinational gate lies on any global max-depth path."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        self._resolve_instance(gate_name)
+        if gate_name not in nl.nodes:
+            raise ValueError(f"Instance {gate_name!r} is not a combinational gate.")
+
+        def expand_declared(name: str) -> List[str]:
+            wi = nl.wires.get(name)
+            if wi and wi.is_bus:
+                lo, hi = sorted((wi.lsb, wi.msb))
+                return [f"{name}[{bit}]" for bit in range(lo, hi + 1)]
+            return [name]
+
+        source_signals: Set[str] = set()
+        for name in nl.primary_inputs:
+            source_signals.update(expand_declared(name))
+            source_signals.add(name)
+        for dff in nl.dffs.values():
+            if dff.q:
+                source_signals.add(dff.q)
+
+        sink_signals: Set[str] = set()
+        for name in nl.primary_outputs:
+            sink_signals.update(expand_declared(name))
+            sink_signals.add(name)
+        for dff in nl.dffs.values():
+            if dff.d:
+                sink_signals.add(dff.d)
+
+        comb_driver = {node.output: node for node in nl.nodes.values()}
+        fanout = self._build_fanout_map()
+        depth_from_source: Dict[str, Optional[int]] = {}
+        depth_to_sink: Dict[str, Optional[int]] = {}
+        active_from: Set[str] = set()
+        active_to: Set[str] = set()
+
+        def longest_from_source(signal_name: str) -> Optional[int]:
+            if signal_name in depth_from_source:
+                return depth_from_source[signal_name]
+            if signal_name in source_signals:
+                depth_from_source[signal_name] = 0
+                return 0
+            if signal_name in {"1'b0", "1'b1"} or signal_name in active_from:
+                depth_from_source[signal_name] = None
+                return None
+            node = comb_driver.get(signal_name)
+            if node is None:
+                depth_from_source[signal_name] = None
+                return None
+            active_from.add(signal_name)
+            candidates = [
+                depth
+                for input_signal in node.inputs
+                if (depth := longest_from_source(input_signal)) is not None
+            ]
+            active_from.discard(signal_name)
+            if not candidates:
+                depth_from_source[signal_name] = None
+                return None
+            depth_from_source[signal_name] = max(candidates) + 1
+            return depth_from_source[signal_name]
+
+        def longest_to_sink(signal_name: str) -> Optional[int]:
+            if signal_name in depth_to_sink:
+                return depth_to_sink[signal_name]
+            if signal_name in sink_signals:
+                depth_to_sink[signal_name] = 0
+                return 0
+            if signal_name in {"1'b0", "1'b1"} or signal_name in active_to:
+                depth_to_sink[signal_name] = None
+                return None
+            active_to.add(signal_name)
+            candidates: List[int] = []
+            for consumer_name in fanout.get(signal_name, []):
+                if consumer_name in nl.nodes:
+                    consumer = nl.nodes[consumer_name]
+                    depth = longest_to_sink(consumer.output)
+                    if depth is not None:
+                        candidates.append(depth + 1)
+                elif consumer_name in nl.dffs:
+                    # DFF D pins are sink boundaries; do not cross the DFF.
+                    if nl.dffs[consumer_name].d == signal_name:
+                        candidates.append(0)
+            active_to.discard(signal_name)
+            if not candidates:
+                depth_to_sink[signal_name] = None
+                return None
+            depth_to_sink[signal_name] = max(candidates)
+            return depth_to_sink[signal_name]
+
+        all_sink_depths = [
+            depth
+            for signal_name in sink_signals
+            if (depth := longest_from_source(signal_name)) is not None
+        ]
+        global_max_depth = max(all_sink_depths, default=-1)
+
+        gate = nl.nodes[gate_name]
+        input_depths = [
+            depth
+            for input_signal in gate.inputs
+            if (depth := longest_from_source(input_signal)) is not None
+        ]
+        output_to_sink = longest_to_sink(gate.output)
+
+        if input_depths and output_to_sink is not None:
+            best_path_depth = max(input_depths) + 1 + output_to_sink
+        else:
+            best_path_depth = -1
+
+        return {
+            "gate": gate_name,
+            "gate_type": gate.gate_type,
+            "gate_output": gate.output,
+            "global_max_depth": global_max_depth,
+            "best_path_depth_through_gate": best_path_depth,
+            "on_any_max_depth_path": (
+                global_max_depth >= 0 and best_path_depth == global_max_depth
+            ),
+        }
+
     def path_passes_through(
         self, source: str, sink: str, node: str
     ) -> bool:
@@ -647,19 +772,110 @@ class EDAEngine:
             sink:   Ending signal.
             node:   Candidate mandatory waypoint signal.
         """
+        return bool(
+            self.paths_pass_through_report(source, sink, node)[
+                "all_paths_pass_through"
+            ]
+        )
+
+    def paths_pass_through_report(
+        self, source: str, sink: str, through: str
+    ) -> dict:
+        """Report whether every combinational source-to-sink path uses a node.
+
+        The through node may be either a signal name or a combinational gate
+        instance. Paths are searched on an alternating signal/gate graph, so
+        gate instances are first-class path nodes.
+        """
         self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
         self._resolve_signal(source)
         self._resolve_signal(sink)
-        self._resolve_signal(node)
 
-        # If there is ANY path from source to sink that avoids node → False
-        avoiding = self.find_path_avoiding(source, sink, node)
-        if avoiding is not None:
-            return False
+        through_type = ""
+        if through in nl.nodes:
+            through_type = "combinational_gate"
+        else:
+            self._resolve_signal(through)
+            through_type = "signal"
 
-        # Check that at least one path exists through node
-        depth, _ = self.get_max_depth(source, sink)
-        return depth >= 0
+        consumers: Dict[str, List[str]] = {}
+        for inst_name, gate in nl.nodes.items():
+            for input_signal in gate.inputs:
+                consumers.setdefault(input_signal, []).append(inst_name)
+
+        def format_path(path: List[Tuple[str, str]]) -> List[str]:
+            return [
+                f"{kind}:{name}" if kind == "gate" else name
+                for kind, name in path
+            ]
+
+        def find_path(avoid_kind: Optional[str] = None) -> Optional[List[str]]:
+            start = ("signal", source)
+            if avoid_kind == "signal" and source == through:
+                return None
+            if avoid_kind == "signal" and sink == through:
+                return None
+
+            queue: deque[List[Tuple[str, str]]] = deque([[start]])
+            visited: Set[Tuple[str, str]] = {start}
+
+            while queue:
+                path = queue.popleft()
+                kind, name = path[-1]
+                if kind == "signal" and name == sink:
+                    return format_path(path)
+
+                next_nodes: List[Tuple[str, str]] = []
+                if kind == "signal":
+                    for inst_name in consumers.get(name, []):
+                        if avoid_kind == "gate" and inst_name == through:
+                            continue
+                        next_nodes.append(("gate", inst_name))
+                else:
+                    output_signal = nl.nodes[name].output
+                    if avoid_kind == "signal" and output_signal == through:
+                        continue
+                    next_nodes.append(("signal", output_signal))
+
+                for next_node in next_nodes:
+                    if next_node in visited:
+                        continue
+                    visited.add(next_node)
+                    queue.append(path + [next_node])
+            return None
+
+        any_path = find_path()
+        if any_path is None:
+            return {
+                "source": source,
+                "sink": sink,
+                "through": through,
+                "through_type": through_type,
+                "path_exists": False,
+                "all_paths_pass_through": False,
+                "counterexample_path": None,
+                "example_path": None,
+                "reason": "No combinational path exists from source to sink.",
+            }
+
+        avoiding_path = find_path("gate" if through_type == "combinational_gate" else "signal")
+        return {
+            "source": source,
+            "sink": sink,
+            "through": through,
+            "through_type": through_type,
+            "path_exists": True,
+            "all_paths_pass_through": avoiding_path is None,
+            "counterexample_path": avoiding_path,
+            "example_path": any_path,
+            "reason": (
+                "No path avoiding the through node was found."
+                if avoiding_path is None
+                else "A path avoiding the through node exists."
+            ),
+        }
 
     def find_path_avoiding(
         self, source: str, sink: str, avoid: str
@@ -855,7 +1071,6 @@ class EDAEngine:
     def find_register_to_register_paths(
         self,
         inline_limit: int = 10,
-        max_paths: int = 100000,
     ) -> dict:
         """Enumerate combinational paths from every DFF Q pin to every DFF D pin."""
         self._require_netlist()
@@ -896,7 +1111,6 @@ class EDAEngine:
         report_path = os.path.abspath(report.name)
         inline_paths: List[dict] = []
         count = 0
-        truncated = False
 
         def record_path(
             source_dff: str,
@@ -933,17 +1147,10 @@ class EDAEngine:
             gate_path: List[str],
             visited_signals: Set[str],
         ) -> None:
-            nonlocal truncated
             for sink_dff in dff_sinks.get(signal_name, []):
-                if count >= max_paths:
-                    truncated = True
-                    return
                 record_path(source_dff, source_q, sink_dff, signal_name, gate_path)
 
             for gate_name in consumers.get(signal_name, []):
-                if count >= max_paths:
-                    truncated = True
-                    return
                 output_signal = nl.nodes[gate_name].output
                 if output_signal not in reaches_dff_d or output_signal in visited_signals:
                     continue
@@ -952,25 +1159,17 @@ class EDAEngine:
                 walk(source_dff, source_q, output_signal, gate_path, visited_signals)
                 gate_path.pop()
                 visited_signals.remove(output_signal)
-                if truncated:
-                    return
 
         try:
             report.write("# Register-to-register combinational paths\n")
             for source_dff, dff in nl.dffs.items():
-                if truncated:
-                    break
                 if not dff.q or dff.q not in reaches_dff_d:
                     continue
                 walk(source_dff, dff.q, dff.q, [], {dff.q})
         finally:
-            if truncated:
-                report.write(
-                    f"# Truncated after {max_paths} paths (safety limit reached).\n"
-                )
             report.close()
 
-        result = {"count": count, "truncated": truncated}
+        result = {"count": count}
         if count <= inline_limit:
             result["paths"] = inline_paths
             try:
@@ -1191,25 +1390,67 @@ class EDAEngine:
         return self.get_fanout(output_signal)
 
     def list_signals(self) -> dict:
-        """Return a dictionary of available signal name lists in the current netlist.
+        """Return compact signal inventory for the current netlist.
 
-        Returns keys: `primary_inputs`, `primary_outputs`, `wires`, `gate_outputs`, `dff_q`, `dff_d`.
+        Large signal lists are written to files under the workspace temp
+        directory. The returned JSON contains counts and small samples only.
         """
         self._require_netlist()
         nl = self._netlist
         assert nl is not None
 
-        gate_outputs = [n.output for n in nl.nodes.values()]
-        dff_q = [d.q for d in nl.dffs.values()]
-        dff_d = [d.d for d in nl.dffs.values()]
-
-        return {
+        categories = {
             "primary_inputs": list(nl.primary_inputs),
             "primary_outputs": list(nl.primary_outputs),
             "wires": list(nl.wires.keys()),
-            "gate_outputs": gate_outputs,
-            "dff_q": dff_q,
-            "dff_d": dff_d,
+            "gate_outputs": [n.output for n in nl.nodes.values()],
+            "dff_q": [d.q for d in nl.dffs.values()],
+            "dff_d": [d.d for d in nl.dffs.values()],
+        }
+
+        result = {
+            "counts": {name: len(values) for name, values in categories.items()},
+            "samples": {name: values[:10] for name, values in categories.items()},
+        }
+        file_paths: Dict[str, str] = {}
+        for name, values in categories.items():
+            if len(values) <= 100:
+                continue
+            report = tempfile.NamedTemporaryFile(
+                "w",
+                prefix=f"signals_{name}_",
+                suffix=".txt",
+                dir=_workspace_temp_dir(),
+                delete=False,
+            )
+            with report:
+                report.write(f"# {name} (count: {len(values)})\n")
+                for value in values:
+                    report.write(f"{value}\n")
+            file_paths[name] = os.path.abspath(report.name)
+        if file_paths:
+            result["file_paths"] = file_paths
+        return result
+
+    def count_primary_ios(self) -> dict:
+        """Return declared and bit-expanded primary input/output counts."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        def width(name: str) -> int:
+            wi = nl.wires.get(name)
+            return wi.width if wi else 1
+
+        input_ports = list(nl.primary_inputs)
+        output_ports = list(nl.primary_outputs)
+        return {
+            "primary_input_ports": len(input_ports),
+            "primary_output_ports": len(output_ports),
+            "primary_input_bits": sum(width(name) for name in input_ports),
+            "primary_output_bits": sum(width(name) for name in output_ports),
+            "primary_inputs": input_ports,
+            "primary_outputs": output_ports,
         }
 
     def are_same_clock_domain(self, dff1: str, dff2: str) -> bool:
@@ -1635,6 +1876,96 @@ sat {' '.join(constraints)}
                 results.append(inst_name)
         return results
 
+    def find_gates(
+        self,
+        gate_type: str = "",
+        input_count: Optional[int] = None,
+        has_input: Optional[str] = None,
+        inline_limit: int = 50,
+    ) -> dict:
+        """Find combinational gates matching structural filters."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        gate_type = gate_type.strip().lower()
+        if gate_type and gate_type not in PRIMITIVE_GATES:
+            raise ValueError(f"Unknown gate type: {gate_type!r}")
+
+        def normalize_signal(signal_name: str) -> str:
+            aliases = {
+                "0": "1'b0",
+                "'0": "1'b0",
+                "1": "1'b1",
+                "'1": "1'b1",
+            }
+            key = signal_name.strip().lower()
+            return aliases.get(key, signal_name.strip())
+
+        wanted_input = normalize_signal(has_input) if has_input else None
+        matches: List[dict] = []
+
+        for inst_name, node in nl.nodes.items():
+            if gate_type and node.gate_type != gate_type:
+                continue
+            if input_count is not None and len(node.inputs) != input_count:
+                continue
+
+            normalized_inputs = [normalize_signal(sig) for sig in node.inputs]
+            matched_indices: List[int] = []
+            if wanted_input is not None:
+                matched_indices = [
+                    idx
+                    for idx, signal_name in enumerate(normalized_inputs)
+                    if signal_name == wanted_input
+                ]
+                if not matched_indices:
+                    continue
+
+            matches.append(
+                {
+                    "instance": inst_name,
+                    "gate_type": node.gate_type,
+                    "output": node.output,
+                    "inputs": list(node.inputs),
+                    "matched_input_indices": matched_indices,
+                    "other_inputs": [
+                        sig
+                        for idx, sig in enumerate(node.inputs)
+                        if idx not in set(matched_indices)
+                    ],
+                }
+            )
+
+        result = {
+            "count": len(matches),
+            "gate_type": gate_type or "any",
+            "input_count": input_count,
+            "has_input": has_input,
+        }
+        if len(matches) <= inline_limit:
+            result["matches"] = matches
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="find_gates_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(
+                f"# find_gates count={len(matches)} "
+                f"gate_type={gate_type or 'any'} input_count={input_count} "
+                f"has_input={has_input}\n"
+            )
+            for match in matches:
+                report.write(json.dumps(match, sort_keys=True) + "\n")
+        result["sample_matches"] = matches[:inline_limit]
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
     # ==================================================================
     # TRANSFORMATION OPERATIONS
     # ==================================================================
@@ -1691,19 +2022,22 @@ sat {' '.join(constraints)}
         instance_name: str,
         new_gate_type: str,
         extra_input: Optional[str] = None,
+        new_inputs: Optional[List[str]] = None,
     ) -> None:
         """Replace the gate type of instance_name in-place.
 
         When upgrading from a 1-input gate (buf/not) to a 2-input gate,
         supply *extra_input* to provide the second input signal.  Raises
         ValueError if the port counts are incompatible and no extra_input
-        is provided.
+        is provided. Supply *new_inputs* to explicitly set the replacement
+        gate inputs.
 
         Args:
             instance_name: Existing gate instance to replace.
             new_gate_type: New gate type string.
             extra_input:   Optional second input signal when changing from
                            a 1-input gate to a 2-input gate.
+            new_inputs:    Optional complete input list for the new gate.
         """
         self._require_netlist()
         nl = self._netlist
@@ -1717,6 +2051,25 @@ sat {' '.join(constraints)}
         node = nl.nodes[instance_name]
         old_in_count = len(node.inputs)
         new_in_count = 1 if new_gate_type in ONE_INPUT_GATES else 2
+
+        if new_inputs is not None:
+            if len(new_inputs) != new_in_count:
+                raise ValueError(
+                    f"Gate type {new_gate_type!r} requires {new_in_count} input(s), "
+                    f"but new_inputs has {len(new_inputs)}."
+                )
+            node.gate_type = new_gate_type
+            node.inputs = list(new_inputs)
+            for input_signal in new_inputs:
+                if input_signal in {"1'b0", "1'b1"}:
+                    continue
+                if (
+                    input_signal not in nl.wires
+                    and input_signal not in nl.primary_inputs
+                    and input_signal not in nl.primary_outputs
+                ):
+                    self._add_wire(input_signal)
+            return
 
         if old_in_count == new_in_count:
             node.gate_type = new_gate_type

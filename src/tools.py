@@ -178,6 +178,29 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "is_gate_on_any_max_depth_path",
+            "description": (
+                "Determine whether a combinational gate instance lies on at least one "
+                "global maximum-depth combinational path of the design. Use this exact "
+                "tool for prompts such as 'Determine whether gate g0 lies on any "
+                "maximum-depth path of the design'. This does not require a specific "
+                "source/sink and does not enumerate paths."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_name": {
+                        "type": "string",
+                        "description": "Combinational gate instance name, such as g0.",
+                    },
+                },
+                "required": ["gate_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_max_depth",
             "description": (
                 "Find the longest combinational path between two CONCRETE signal names. "
@@ -209,8 +232,11 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "path_passes_through",
             "description": (
                 "Call this to determine whether ALL combinational paths from source to sink "
-                "pass through a specific intermediate node. "
-                "Returns true if node is a mandatory waypoint on every source→sink path."
+                "pass through a specific intermediate node. The node may be either a signal "
+                "name or a combinational gate instance such as g0. Use this exact tool for "
+                "prompts like 'Does every path from input n2 to output n12 pass through gate g0?'. "
+                "The result reports whether any source-to-sink path exists, whether all such "
+                "paths pass through the node, and a counterexample path when one avoids it."
             ),
             "parameters": {
                 "type": "object",
@@ -219,7 +245,7 @@ TOOLS: List[Dict[str, Any]] = [
                     "sink": {"type": "string", "description": "Ending signal name."},
                     "node": {
                         "type": "string",
-                        "description": "The intermediate signal to test.",
+                        "description": "The intermediate signal or combinational gate instance to test.",
                     },
                 },
                 "required": ["source", "sink", "node"],
@@ -335,8 +361,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "It traverses from every DFF Q pin to reached DFF D pins and reports the ordered gates. "
                 "Do not use list_signals, get_max_depth, or get_max_depth_between_endpoint_classes. "
                 "Up to 10 paths are returned inline; larger results are written under ./_tmp/ and the "
-                "result returns the path count and file path. Enumeration has a 100,000-path safety "
-                "limit and returns truncated=true when that limit is reached; this must be disclosed."
+                "result returns the path count and file path. The full enumeration is streamed to the "
+                "file so large path sets are not returned as giant JSON."
             ),
             "parameters": {
                 "type": "object",
@@ -538,8 +564,11 @@ TOOLS: List[Dict[str, Any]] = [
                 "Call this to replace the gate type of an existing instance in-place. "
                 "When replacing a 1-input gate (buf/not) with a 2-input gate (and/or/nand/nor/xor/xnor), "
                 "supply extra_input to provide the additional input signal. "
-                "Use this to swap e.g. a buf for a not, an and for an or, "
-                "or a buf for an and with a gating control signal."
+                "Use new_inputs to explicitly choose the inputs kept by the replacement. "
+                "Use this exact tool after find_gates for constant-input propagation, such as "
+                "simplifying nand(Y, A, 1'b1) or nand(Y, 1'b1, A) into not(Y, A). "
+                "When several reported instances need the same kind of structural simplification, "
+                "use the replacements batch argument."
             ),
             "parameters": {
                 "type": "object",
@@ -559,8 +588,47 @@ TOOLS: List[Dict[str, Any]] = [
                             "a 1-input gate (buf/not) to a 2-input gate."
                         ),
                     },
+                    "new_inputs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional complete input list for the replacement gate. "
+                            "Use this when reducing a 2-input gate to a 1-input gate "
+                            "and the kept input is not simply the first existing input."
+                        ),
+                    },
+                    "replacements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "instance_name": {
+                                    "type": "string",
+                                    "description": "Instance name of the gate to replace.",
+                                },
+                                "new_gate_type": {
+                                    "type": "string",
+                                    "description": "Replacement gate type.",
+                                },
+                                "new_inputs": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Complete input list for this replacement.",
+                                },
+                                "extra_input": {
+                                    "type": "string",
+                                    "description": "Optional extra input for this replacement.",
+                                },
+                            },
+                            "required": ["instance_name", "new_gate_type"],
+                        },
+                        "description": (
+                            "Optional batch of replacements. Use this after a finder returns "
+                            "several instances that should all receive structural replacements."
+                        ),
+                    },
                 },
-                "required": ["instance_name", "new_gate_type"],
+                "required": [],
             },
         },
     },
@@ -733,6 +801,44 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_gates",
+            "description": (
+                "Find combinational gate instances by structural filters: gate type, input count, "
+                "and/or exact input signal. Use this before generic replacements for prompts like "
+                "'all 2-input NAND gates that have one input tied to constant 1'. For constant 1, "
+                "pass has_input=\"1'b1\"; for constant 0, pass has_input=\"1'b0\". The result includes "
+                "the matching instances, their inputs, matched input indices, and other_inputs. "
+                "For later prompts that say 'reported gates' or 'reported NAND gates', use the "
+                "most recent relevant find_gates result from context; if it reported zero matches, "
+                "do not transform anything."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_type": {
+                        "type": "string",
+                        "description": "Gate type filter such as 'nand', 'and', or ''. Empty string matches all types.",
+                    },
+                    "input_count": {
+                        "type": "integer",
+                        "description": "Optional exact number of inputs to match, such as 2.",
+                    },
+                    "has_input": {
+                        "type": "string",
+                        "description": "Optional exact input signal to match, such as \"1'b1\" or \"1'b0\".",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum number of matches to return inline before writing the full list to ./_tmp/. Defaults to 50.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_instances_by_name_pattern",
             "description": (
                 "Call this to search for gate instances by gate type and/or instance name pattern. "
@@ -887,6 +993,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "all other gates in the cone remain unchanged. "
                 "Use this when asked to 'replace OR gates with NAND+NOT' or 'convert XOR to NAND-only' "
                 "within a cone or across the whole design. "
+                "Do NOT use this for constant propagation, gates with inputs tied to constants, "
+                "or prompts referring to 'reported gates'; use find_gates followed by replace_gate "
+                "with explicit new_inputs for those cases. "
+                "This is a broad technology-remapping tool, not a local simplification tool. "
                 "Set output_signal to null to apply across the entire design. "
                 "Returns success, replaced (count), skipped (count)."
             ),
@@ -1002,10 +1112,28 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "count_primary_ios",
+            "description": (
+                "Count primary inputs and primary outputs in the current design. Use this "
+                "exact tool for prompts such as 'Determine the number of primary inputs "
+                "and outputs.' Returns declared port counts and bit-expanded counts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_signals",
             "description": (
-                "Return lists of signal names available in the currently loaded netlist. "
-                "Provides primary inputs, primary outputs, internal wires, gate outputs and DFF signals."
+                "Return a compact signal inventory for the currently loaded netlist. "
+                "Large lists are written to ./_tmp/ and only counts, samples, and file paths "
+                "are returned inline. Do not use this for simple primary input/output counts; "
+                "use count_primary_ios instead."
             ),
             "parameters": {
                 "type": "object",
