@@ -1,5 +1,2 @@
 test_name,status,message,log_path
-test29,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test29_equiv.log
-test30,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test30_equiv.log
-test31,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test31_equiv.log
-test32,PASS,"Equivalence proven",/home/innocent/iccad2026colab/cada1067/scripts/log/test32_equiv.log
+test35,ERROR,"Timed out after 1000s",/home/innocent/iccad2026colab/cada1067/scripts/log/test35_equiv.log

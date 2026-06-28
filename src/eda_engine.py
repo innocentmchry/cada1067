@@ -6,6 +6,7 @@ import copy
 import itertools
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -313,6 +314,16 @@ class EDAEngine:
         if driver in nl.nodes:
             return list(nl.nodes[driver].inputs)
         return []  # DFF — treat as cut
+
+    def _expand_declared_signal(self, name: str) -> List[str]:
+        """Return bit names for a declared bus, otherwise the signal itself."""
+        nl = self._netlist
+        assert nl is not None
+        wire = nl.wires.get(name)
+        if wire and wire.is_bus:
+            lo, hi = sorted((wire.lsb, wire.msb))
+            return [f"{name}[{bit}]" for bit in range(lo, hi + 1)]
+        return [name]
 
     # ==================================================================
     # ANALYSIS OPERATIONS
@@ -877,6 +888,150 @@ class EDAEngine:
             ),
         }
 
+    def is_wire_cut_between_primary_ios(self, wire_name: str) -> dict:
+        """Check whether a signal is a PI-to-PO cut without enumerating paths.
+
+        A wire is reported as a cut if there exists at least one expanded
+        primary-input bit and one expanded primary-output bit such that a
+        combinational path exists through the wire, and blocking the wire
+        disconnects that PI bit from that PO bit. DFF boundaries are treated
+        as cuts.
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        self._resolve_signal(wire_name)
+
+        candidate_signals = self._expand_declared_signal(wire_name)
+        pi_bits = [
+            bit
+            for name in nl.primary_inputs
+            for bit in self._expand_declared_signal(name)
+        ]
+        po_bits = [
+            bit
+            for name in nl.primary_outputs
+            for bit in self._expand_declared_signal(name)
+        ]
+
+        successors: Dict[str, List[str]] = {}
+        predecessors: Dict[str, List[str]] = {}
+        for gate in nl.nodes.values():
+            for input_signal in gate.inputs:
+                successors.setdefault(input_signal, []).append(gate.output)
+                predecessors.setdefault(gate.output, []).append(input_signal)
+
+        def forward_reachable(
+            starts: List[str], blocked: Optional[Set[str]] = None
+        ) -> Set[str]:
+            blocked = blocked or set()
+            seen: Set[str] = set()
+            queue: deque[str] = deque()
+            for start in starts:
+                if start in blocked or start in seen:
+                    continue
+                seen.add(start)
+                queue.append(start)
+            while queue:
+                signal_name = queue.popleft()
+                for next_signal in successors.get(signal_name, []):
+                    if next_signal in blocked or next_signal in seen:
+                        continue
+                    seen.add(next_signal)
+                    queue.append(next_signal)
+            return seen
+
+        def backward_reachable(starts: List[str]) -> Set[str]:
+            seen: Set[str] = set(starts)
+            queue: deque[str] = deque(starts)
+            while queue:
+                signal_name = queue.popleft()
+                for prev_signal in predecessors.get(signal_name, []):
+                    if prev_signal in seen:
+                        continue
+                    seen.add(prev_signal)
+                    queue.append(prev_signal)
+            return seen
+
+        pi_set = set(pi_bits)
+        po_set = set(po_bits)
+        details = []
+        is_on_any_path = False
+        is_cut = False
+        cut_pairs = []
+        upstream_all: Set[str] = set()
+        downstream_all: Set[str] = set()
+
+        for candidate in candidate_signals:
+            upstream_pis = sorted(pi_set & backward_reachable([candidate]))
+            downstream_pos = sorted(po_set & forward_reachable([candidate]))
+            upstream_all.update(upstream_pis)
+            downstream_all.update(downstream_pos)
+            candidate_on_path = bool(upstream_pis and downstream_pos)
+            is_on_any_path = is_on_any_path or candidate_on_path
+
+            blocked_pairs = []
+            if candidate_on_path:
+                for pi in upstream_pis:
+                    reachable_without_candidate = forward_reachable(
+                        [pi], blocked={candidate}
+                    )
+                    for po in downstream_pos:
+                        if po not in reachable_without_candidate:
+                            blocked_pairs.append({"primary_input": pi, "primary_output": po})
+                            if len(cut_pairs) < 10:
+                                cut_pairs.append(
+                                    {"primary_input": pi, "primary_output": po}
+                                )
+
+            candidate_is_cut = bool(blocked_pairs)
+            is_cut = is_cut or candidate_is_cut
+            details.append(
+                {
+                    "signal": candidate,
+                    "is_on_any_pi_po_path": candidate_on_path,
+                    "is_cut": candidate_is_cut,
+                    "upstream_primary_input_count": len(upstream_pis),
+                    "downstream_primary_output_count": len(downstream_pos),
+                    "cut_pair_count": len(blocked_pairs),
+                    "upstream_primary_inputs_sample": upstream_pis[:10],
+                    "downstream_primary_outputs_sample": downstream_pos[:10],
+                }
+            )
+
+        if not is_on_any_path:
+            reason = (
+                f"{wire_name} is not on any combinational path from an expanded "
+                "primary input to an expanded primary output."
+            )
+        elif is_cut:
+            reason = (
+                f"Blocking {wire_name} disconnects at least one primary-input "
+                "bit from at least one primary-output bit."
+            )
+        else:
+            reason = (
+                f"{wire_name} lies on at least one PI-to-PO path, but no checked "
+                "PI/PO pair depends on it as a mandatory cut."
+            )
+
+        return {
+            "wire": wire_name,
+            "candidate_signals": candidate_signals,
+            "primary_input_bit_count": len(pi_bits),
+            "primary_output_bit_count": len(po_bits),
+            "is_on_any_pi_po_path": is_on_any_path,
+            "is_cut_between_primary_io": is_cut,
+            "answer": "yes" if is_cut else "no",
+            "upstream_primary_input_count": len(upstream_all),
+            "downstream_primary_output_count": len(downstream_all),
+            "upstream_primary_inputs_sample": sorted(upstream_all)[:10],
+            "downstream_primary_outputs_sample": sorted(downstream_all)[:10],
+            "cut_pairs_sample": cut_pairs,
+            "details": details,
+            "reason": reason,
+        }
+
     def find_path_avoiding(
         self, source: str, sink: str, avoid: str
     ) -> Optional[List[str]]:
@@ -952,7 +1107,54 @@ class EDAEngine:
         Args:
             output_signal: The target output net name.
         """
-        return len(self.get_logic_cone(output_signal))
+        return int(self.count_gate_types_in_cone(output_signal)["total"])
+
+    def count_gate_types_in_cone(self, output_signal: str) -> dict:
+        """Return total and per-type gate counts in the logic cone."""
+        self._require_netlist()
+        self._resolve_signal(output_signal)
+        nl = self._netlist
+        assert nl is not None
+
+        actual_output = output_signal
+        dff_q_to_d = {dff.q: dff.d for dff in nl.dffs.values()}
+        if output_signal in dff_q_to_d:
+            actual_output = dff_q_to_d[output_signal]
+
+        out2gate = self._build_output_to_gate()
+        pi_set = set(nl.primary_inputs)
+        dff_outputs = {dff.q for dff in nl.dffs.values()}
+
+        cone_insts: Set[str] = set()
+        visited: Set[str] = set()
+        stack = [actual_output]
+        while stack:
+            sig = stack.pop()
+            if sig in visited:
+                continue
+            visited.add(sig)
+            if sig in {"1'b0", "1'b1"} or sig in pi_set or sig in dff_outputs:
+                continue
+            driver = out2gate.get(sig)
+            if driver is None or driver not in nl.nodes:
+                continue
+            if driver in cone_insts:
+                continue
+            cone_insts.add(driver)
+            stack.extend(nl.nodes[driver].inputs)
+
+        by_type: Dict[str, int] = {}
+        for inst in cone_insts:
+            gate_type = nl.nodes[inst].gate_type
+            by_type[gate_type] = by_type.get(gate_type, 0) + 1
+
+        return {
+            "output_signal": output_signal,
+            "resolved_output": actual_output,
+            "total": len(cone_insts),
+            "by_type": dict(sorted(by_type.items())),
+        }
+
     def _nodes_reaching_sink(self, sink: str) -> Set[str]:
         """Return all signals that can reach sink."""
 
@@ -1438,20 +1640,69 @@ class EDAEngine:
         nl = self._netlist
         assert nl is not None
 
-        def width(name: str) -> int:
-            wi = nl.wires.get(name)
-            return wi.width if wi else 1
-
         input_ports = list(nl.primary_inputs)
         output_ports = list(nl.primary_outputs)
+        input_details = [self._port_detail(name) for name in input_ports]
+        output_details = [self._port_detail(name) for name in output_ports]
         return {
             "primary_input_ports": len(input_ports),
             "primary_output_ports": len(output_ports),
-            "primary_input_bits": sum(width(name) for name in input_ports),
-            "primary_output_bits": sum(width(name) for name in output_ports),
+            "primary_input_bits": sum(item["width"] for item in input_details),
+            "primary_output_bits": sum(item["width"] for item in output_details),
             "primary_inputs": input_ports,
             "primary_outputs": output_ports,
         }
+
+    def _port_detail(self, name: str) -> dict:
+        """Return declared width/range metadata for one top-level port."""
+        nl = self._netlist
+        assert nl is not None
+        wire = nl.wires.get(name)
+        if wire is None:
+            return {"name": name, "width": 1, "range": None, "bits": [name]}
+        bits = self._expand_declared_signal(name)
+        return {
+            "name": name,
+            "width": wire.width,
+            "range": f"[{wire.msb}:{wire.lsb}]" if wire.is_bus else None,
+            "bits": bits,
+        }
+
+    def list_primary_ios(self) -> dict:
+        """Return primary input/output ports with declared bit widths."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        primary_inputs = [self._port_detail(name) for name in nl.primary_inputs]
+        primary_outputs = [self._port_detail(name) for name in nl.primary_outputs]
+        return {
+            "primary_input_ports": len(primary_inputs),
+            "primary_output_ports": len(primary_outputs),
+            "primary_input_bits": sum(item["width"] for item in primary_inputs),
+            "primary_output_bits": sum(item["width"] for item in primary_outputs),
+            "primary_inputs": primary_inputs,
+            "primary_outputs": primary_outputs,
+        }
+
+    def find_zero_length_pi_po_paths(self) -> dict:
+        """Return direct zero-gate paths where a PI is also a PO."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        output_set = set(nl.primary_outputs)
+        paths = [
+            {
+                "source": pi,
+                "sink": pi,
+                "gates": [],
+                "description": f"{pi} is both a primary input and primary output",
+            }
+            for pi in nl.primary_inputs
+            if pi in output_set
+        ]
+        return {"count": len(paths), "paths": paths}
 
     def are_same_clock_domain(self, dff1: str, dff2: str) -> bool:
         """Return True if both DFFs share the same clock net.
@@ -1469,6 +1720,66 @@ class EDAEngine:
                 raise ValueError(f"DFF instance {d!r} not found in netlist.")
 
         return nl.dffs[dff1].ck == nl.dffs[dff2].ck
+
+    def list_flip_flops_by_clock(
+        self, clock_signal: str, inline_limit: int = 50
+    ) -> dict:
+        """List DFF instances whose clock pin is driven by *clock_signal*."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        clock_signal = clock_signal.strip()
+        self._resolve_signal(clock_signal)
+
+        matches: List[dict] = []
+        for inst_name, dff in nl.dffs.items():
+            if dff.ck != clock_signal:
+                continue
+            matches.append(
+                {
+                    "instance": inst_name,
+                    "clock": dff.ck,
+                    "d": dff.d,
+                    "q": dff.q,
+                    "rn": dff.rn,
+                    "sn": dff.sn,
+                }
+            )
+
+        result = {
+            "clock_signal": clock_signal,
+            "count": len(matches),
+        }
+        if len(matches) <= inline_limit:
+            result["flip_flops"] = matches
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix=f"dffs_clock_{re.sub(r'[^A-Za-z0-9_]+', '_', clock_signal)}_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(
+                f"# list_flip_flops_by_clock clock={clock_signal} "
+                f"count={len(matches)}\n"
+            )
+            report.write("# columns: instance clock d q rn sn\n")
+            for item in matches:
+                report.write(
+                    "# "
+                    f"{item['instance']} {item['clock']} {item['d']} "
+                    f"{item['q']} {item['rn']} {item['sn']}\n"
+                )
+            report.write("# jsonl:\n")
+            for item in matches:
+                report.write(json.dumps(item, sort_keys=True) + "\n")
+        result["sample_flip_flops"] = matches[:inline_limit]
+        result["file_path"] = os.path.abspath(report.name)
+        return result
 
     def check_signal_equivalence(self, sig1: str, sig2: str) -> bool:
         """Check if two signals in the current netlist are functionally equivalent.
@@ -1615,6 +1926,566 @@ sat {' '.join(constraints)}
 
         # Signals are equivalent if neither contradictory scenario is satisfiable
         return not sat01 and not sat10
+
+    def _check_gate_expression_equivalence(
+        self, gate_type: str, inputs: List[str], target_signal: str
+    ) -> bool:
+        """Check whether a virtual primitive gate over existing signals equals target."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        gate_type = gate_type.strip().lower()
+        if gate_type in ONE_INPUT_GATES:
+            expected_inputs = 1
+        elif gate_type in TWO_INPUT_GATES:
+            expected_inputs = 2
+        else:
+            raise ValueError(f"Unsupported primitive gate type: {gate_type!r}")
+        if len(inputs) != expected_inputs:
+            raise ValueError(
+                f"{gate_type!r} expects {expected_inputs} input(s), got {len(inputs)}."
+            )
+
+        constant_aliases = {
+            "0": "1'b0", "1": "1'b1", "'0": "1'b0", "'1": "1'b1"
+        }
+        normalized_inputs = [
+            constant_aliases.get(str(signal_name).strip().lower(), signal_name)
+            for signal_name in inputs
+        ]
+        target_signal = constant_aliases.get(
+            str(target_signal).strip().lower(), target_signal
+        )
+        for signal_name in normalized_inputs + [target_signal]:
+            self._resolve_signal(signal_name)
+
+        comb_nl = copy.deepcopy(nl)
+        q_aliases: Dict[str, str] = {}
+        for index, dff in enumerate(comb_nl.dffs.values()):
+            if not dff.q or dff.q in q_aliases:
+                continue
+            alias = f"_expr_equiv_q_{index}"
+            q_aliases[dff.q] = alias
+            comb_nl.wires[alias] = WireInfo(name=alias)
+            comb_nl.primary_inputs.append(alias)
+        for node in comb_nl.nodes.values():
+            node.inputs = [q_aliases.get(sig, sig) for sig in node.inputs]
+        comb_nl.dffs.clear()
+
+        sat_inputs = [q_aliases.get(signal_name, signal_name) for signal_name in normalized_inputs]
+        sat_target = q_aliases.get(target_signal, target_signal)
+        expr_signal = "_expr_equiv_out"
+        expr_inst = "_expr_equiv_gate"
+        suffix = 0
+        while expr_signal in comb_nl.wires:
+            suffix += 1
+            expr_signal = f"_expr_equiv_out_{suffix}"
+            expr_inst = f"_expr_equiv_gate_{suffix}"
+
+        comb_nl.wires[expr_signal] = WireInfo(name=expr_signal)
+        comb_nl.nodes[expr_inst] = GateNode(
+            name=expr_inst,
+            gate_type=gate_type,
+            inputs=sat_inputs,
+            output=expr_signal,
+        )
+
+        if sat_target in {"1'b0", "1'b1"}:
+            prove_signal = expr_signal
+            prove_value = sat_target[-1]
+            comb_nl.primary_outputs.append(expr_signal)
+        else:
+            diff_signal = "_expr_equiv_diff"
+            diff_inst = "_expr_equiv_diff_gate"
+            while diff_signal in comb_nl.wires:
+                suffix += 1
+                diff_signal = f"_expr_equiv_diff_{suffix}"
+                diff_inst = f"_expr_equiv_diff_gate_{suffix}"
+            comb_nl.wires[diff_signal] = WireInfo(name=diff_signal)
+            comb_nl.primary_outputs.append(diff_signal)
+            comb_nl.nodes[diff_inst] = GateNode(
+                name=diff_inst,
+                gate_type="xor",
+                inputs=[expr_signal, sat_target],
+                output=diff_signal,
+            )
+            prove_signal = diff_signal
+            prove_value = "0"
+
+        out_to_inst = {
+            node.output: inst_name for inst_name, node in comb_nl.nodes.items()
+        }
+        needed_signals: Set[str] = set()
+        needed_nodes: Set[str] = set()
+        queue: deque[str] = deque([prove_signal])
+        while queue:
+            signal_name = queue.popleft()
+            if signal_name in needed_signals:
+                continue
+            needed_signals.add(signal_name)
+            inst_name = out_to_inst.get(signal_name)
+            if not inst_name or inst_name in needed_nodes:
+                continue
+            needed_nodes.add(inst_name)
+            for input_signal in comb_nl.nodes[inst_name].inputs:
+                if input_signal not in {"1'b0", "1'b1"}:
+                    queue.append(input_signal)
+
+        comb_nl.nodes = {
+            inst_name: node
+            for inst_name, node in comb_nl.nodes.items()
+            if inst_name in needed_nodes
+        }
+        used_signals: Set[str] = {prove_signal}
+        for node in comb_nl.nodes.values():
+            used_signals.add(node.output)
+            used_signals.update(
+                input_signal
+                for input_signal in node.inputs
+                if input_signal not in {"1'b0", "1'b1"}
+            )
+        comb_nl.primary_inputs = [
+            signal_name for signal_name in comb_nl.primary_inputs
+            if signal_name in used_signals
+        ]
+        comb_nl.primary_outputs = [prove_signal]
+        comb_nl.wires = {
+            signal_name: wire
+            for signal_name, wire in comb_nl.wires.items()
+            if signal_name in used_signals
+            or signal_name in comb_nl.primary_inputs
+            or signal_name in comb_nl.primary_outputs
+        }
+
+        tf = tempfile.NamedTemporaryFile(
+            "w", suffix=".v", dir=_workspace_temp_dir(), delete=False
+        )
+        netlist_path = tf.name
+        tf.close()
+        write_verilog(comb_nl, netlist_path)
+        try:
+            script = f"""
+read_verilog {netlist_path}
+prep -top {comb_nl.module_name}
+sat -prove {prove_signal} {prove_value} -verify
+"""
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".ys", dir=_workspace_temp_dir(), delete=False
+            ) as script_f:
+                script_f.write(script)
+                script_f.flush()
+                script_path = script_f.name
+            try:
+                result = subprocess.run(
+                    [_yosys_binary(), "-s", script_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=_temp_subprocess_env(),
+                    cwd=_workspace_temp_dir(),
+                )
+                combined = (result.stdout or "") + "\n" + (result.stderr or "")
+                if result.returncode == 0:
+                    return True
+                lower = combined.lower()
+                if (
+                    "proof did fail" in lower
+                    or "model found" in lower
+                    or "failed to prove" in lower
+                ):
+                    return False
+                raise RuntimeError(
+                    "Yosys expression-equivalence SAT check failed:\n"
+                    + combined[-3000:]
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(
+                    "Yosys expression-equivalence SAT check timed out."
+                ) from exc
+            finally:
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.unlink(netlist_path)
+            except OSError:
+                pass
+
+    def _logic_signature_map(self, pattern_bits: int = 256) -> Dict[str, int]:
+        """Return deterministic random-simulation signatures for known signals."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        mask = (1 << pattern_bits) - 1
+        rng = random.Random(0xCADA1067)
+        signatures: Dict[str, int] = {"1'b0": 0, "1'b1": mask}
+        out2gate = self._build_output_to_gate()
+        driven = set(out2gate)
+
+        boundary_signals: Set[str] = set()
+        for port in nl.primary_inputs:
+            boundary_signals.update(self._expand_declared_signal(port))
+            boundary_signals.add(port)
+        for dff in nl.dffs.values():
+            if dff.q:
+                boundary_signals.add(dff.q)
+
+        # Treat any undriven non-constant gate input as a combinational boundary.
+        for node in nl.nodes.values():
+            for signal_name in node.inputs:
+                if signal_name not in {"1'b0", "1'b1"} and signal_name not in driven:
+                    boundary_signals.add(signal_name)
+
+        for signal_name in sorted(boundary_signals):
+            signatures.setdefault(signal_name, rng.getrandbits(pattern_bits) & mask)
+
+        def eval_gate(gate_type: str, values: List[int]) -> int:
+            if gate_type == "buf":
+                return values[0]
+            if gate_type == "not":
+                return (~values[0]) & mask
+            if gate_type == "and":
+                return values[0] & values[1]
+            if gate_type == "nand":
+                return (~(values[0] & values[1])) & mask
+            if gate_type == "or":
+                return values[0] | values[1]
+            if gate_type == "nor":
+                return (~(values[0] | values[1])) & mask
+            if gate_type == "xor":
+                return values[0] ^ values[1]
+            if gate_type == "xnor":
+                return (~(values[0] ^ values[1])) & mask
+            raise ValueError(f"Unsupported primitive gate type: {gate_type!r}")
+
+        remaining = dict(nl.nodes)
+        progressed = True
+        while remaining and progressed:
+            progressed = False
+            for inst_name, node in list(remaining.items()):
+                if all(input_signal in signatures for input_signal in node.inputs):
+                    values = [signatures[input_signal] for input_signal in node.inputs]
+                    signatures[node.output] = eval_gate(node.gate_type, values)
+                    del remaining[inst_name]
+                    progressed = True
+        return signatures
+
+    def find_binary_gate_equivalent_pair(
+        self,
+        target_signal: str,
+        gate_type: str,
+        candidate_scope: str = "internal",
+        max_signature_pairs: int = 50_000_000,
+        max_formal_checks: int = 3,
+    ) -> dict:
+        """Find existing signals a,b such that gate_type(a,b) equals target_signal."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        gate_type = gate_type.strip().lower()
+        if gate_type not in TWO_INPUT_GATES:
+            raise ValueError(
+                f"find_binary_gate_equivalent_pair requires a 2-input gate, got {gate_type!r}."
+            )
+        candidate_scope = candidate_scope.strip().lower() or "internal"
+        if candidate_scope not in {"internal", "all"}:
+            raise ValueError("candidate_scope must be 'internal' or 'all'.")
+
+        self._resolve_signal(target_signal)
+        signatures = self._logic_signature_map()
+        if target_signal not in signatures:
+            return {
+                "exists": False,
+                "target_signal": target_signal,
+                "gate_type": gate_type,
+                "search_complete": False,
+                "reason": f"No simulation signature available for target {target_signal!r}.",
+            }
+
+        primary_ios = set(nl.primary_inputs) | set(nl.primary_outputs)
+        primary_io_bits: Set[str] = set()
+        for port in primary_ios:
+            primary_io_bits.update(self._expand_declared_signal(port))
+        primary_ios |= primary_io_bits
+
+        candidates: List[str] = []
+        seen_candidates: Set[str] = set()
+        candidate_sources: List[str] = []
+        candidate_sources.extend(node.output for node in nl.nodes.values())
+        candidate_sources.extend(dff.q for dff in nl.dffs.values() if dff.q)
+        candidate_sources.extend(
+            signal_name for signal_name in nl.wires if signal_name in signatures
+        )
+        for signal_name in candidate_sources:
+            if signal_name in seen_candidates or signal_name in {"1'b0", "1'b1"}:
+                continue
+            if signal_name not in signatures:
+                continue
+            if candidate_scope == "internal" and signal_name in primary_ios:
+                continue
+            seen_candidates.add(signal_name)
+            candidates.append(signal_name)
+
+        formal_checks = 0
+        formal_failures = 0
+
+        def formal_limit_result(
+            a_signal: str, b_signal: str, strategy: str, pairs_checked: int
+        ) -> dict:
+            return {
+                "exists": False,
+                "target_signal": target_signal,
+                "gate_type": gate_type,
+                "candidate_scope": candidate_scope,
+                "candidate_signals": len(candidates),
+                "signature_pairs_checked": pairs_checked,
+                "formal_checks": formal_checks,
+                "formal_failures": formal_failures,
+                "search_complete": False,
+                "reason": (
+                    "Signature-compatible candidate pairs exist, but the formal "
+                    f"confirmation budget of {max_formal_checks} checks was reached."
+                ),
+                "next_unconfirmed_candidate": {"a": a_signal, "b": b_signal},
+                "strategy": strategy,
+            }
+
+        def confirm(a_signal: str, b_signal: str, strategy: str, pairs_checked: int) -> Optional[dict]:
+            nonlocal formal_checks, formal_failures
+            if formal_checks >= max_formal_checks:
+                return formal_limit_result(a_signal, b_signal, strategy, pairs_checked)
+            formal_checks += 1
+            try:
+                equivalent = self._check_gate_expression_equivalence(
+                    gate_type, [a_signal, b_signal], target_signal
+                )
+            except (RuntimeError, TimeoutError):
+                formal_failures += 1
+                return None
+            if equivalent:
+                return {
+                    "exists": True,
+                    "target_signal": target_signal,
+                    "gate_type": gate_type,
+                    "a": a_signal,
+                    "b": b_signal,
+                    "candidate_scope": candidate_scope,
+                    "strategy": strategy,
+                    "proof": "yosys_sat_confirmed",
+                    "candidate_signals": len(candidates),
+                    "signature_pairs_checked": pairs_checked,
+                    "formal_checks": formal_checks,
+                    "formal_failures": formal_failures,
+                    "search_complete": True,
+                }
+            return None
+
+        out2gate = self._build_output_to_gate()
+        driver_name = out2gate.get(target_signal)
+        if driver_name and driver_name in nl.nodes:
+            driver = nl.nodes[driver_name]
+            if (
+                driver.gate_type == gate_type
+                and len(driver.inputs) == 2
+                and all(input_signal in seen_candidates for input_signal in driver.inputs)
+            ):
+                found = confirm(driver.inputs[0], driver.inputs[1], "direct_driver", 1)
+                if found:
+                    return found
+
+        by_signature: Dict[int, List[str]] = {}
+        for signal_name in candidates:
+            by_signature.setdefault(signatures[signal_name], []).append(signal_name)
+
+        # Fast De Morgan path: OR(x,y)=NAND(~x,~y), AND(x,y)=NOR(~x,~y).
+        if driver_name and driver_name in nl.nodes:
+            driver = nl.nodes[driver_name]
+            demorgan_source = None
+            if gate_type == "nand" and driver.gate_type == "or" and len(driver.inputs) == 2:
+                demorgan_source = driver
+            elif gate_type == "nor" and driver.gate_type == "and" and len(driver.inputs) == 2:
+                demorgan_source = driver
+            if demorgan_source and all(inp in signatures for inp in demorgan_source.inputs):
+                mask = (1 << 256) - 1
+                left_complements = by_signature.get((~signatures[demorgan_source.inputs[0]]) & mask, [])
+                right_complements = by_signature.get((~signatures[demorgan_source.inputs[1]]) & mask, [])
+                for left_signal in left_complements[:20]:
+                    if not self._check_gate_expression_equivalence(
+                        "not", [left_signal], demorgan_source.inputs[0]
+                    ):
+                        continue
+                    for right_signal in right_complements[:20]:
+                        if not self._check_gate_expression_equivalence(
+                            "not", [right_signal], demorgan_source.inputs[1]
+                        ):
+                            continue
+                        found = confirm(
+                            left_signal, right_signal, "demorgan_driver", 1
+                        )
+                        if found:
+                            return found
+
+        mask = (1 << 256) - 1
+        target_sig = signatures[target_signal]
+
+        def apply_sig(a_sig: int, b_sig: int) -> int:
+            if gate_type == "and":
+                return a_sig & b_sig
+            if gate_type == "nand":
+                return (~(a_sig & b_sig)) & mask
+            if gate_type == "or":
+                return a_sig | b_sig
+            if gate_type == "nor":
+                return (~(a_sig | b_sig)) & mask
+            if gate_type == "xor":
+                return a_sig ^ b_sig
+            if gate_type == "xnor":
+                return (~(a_sig ^ b_sig)) & mask
+            raise AssertionError(gate_type)
+
+        if gate_type in {"and", "nand"}:
+            needed = target_sig if gate_type == "and" else (~target_sig) & mask
+            search_candidates = [
+                signal_name
+                for signal_name in candidates
+                if (needed & ~signatures[signal_name]) == 0
+            ]
+        elif gate_type in {"or", "nor"}:
+            allowed = target_sig if gate_type == "or" else (~target_sig) & mask
+            search_candidates = [
+                signal_name
+                for signal_name in candidates
+                if (signatures[signal_name] & ~allowed) == 0
+            ]
+        else:
+            search_candidates = candidates
+
+        pair_checks = 0
+        if gate_type in {"xor", "xnor"}:
+            required_base = target_sig if gate_type == "xor" else (~target_sig) & mask
+            for left_signal in search_candidates:
+                required_right_sig = required_base ^ signatures[left_signal]
+                for right_signal in by_signature.get(required_right_sig, []):
+                    if right_signal not in seen_candidates:
+                        continue
+                    pair_checks += 1
+                    if pair_checks > max_signature_pairs:
+                        return {
+                            "exists": False,
+                            "target_signal": target_signal,
+                            "gate_type": gate_type,
+                            "candidate_scope": candidate_scope,
+                            "candidate_signals": len(candidates),
+                            "signature_pairs_checked": pair_checks - 1,
+                            "search_complete": False,
+                            "reason": (
+                                "No matching pair found before the signature-search "
+                                f"budget of {max_signature_pairs} pairs was reached."
+                            ),
+                        }
+                    found = confirm(
+                        left_signal,
+                        right_signal,
+                        "signature_filter_then_yosys_sat",
+                        pair_checks,
+                    )
+                    if found:
+                        return found
+            return {
+                "exists": False,
+                "target_signal": target_signal,
+                "gate_type": gate_type,
+                "candidate_scope": candidate_scope,
+                "candidate_signals": len(candidates),
+                "signature_pairs_checked": pair_checks,
+                "search_complete": True,
+                "proof": "exhaustive_signature_search_with_sat_on_matches",
+            }
+
+        candidate_count = len(search_candidates)
+        all_candidate_bits = (1 << candidate_count) - 1
+        one_at_bit: List[int] = [0] * 256
+        for index, signal_name in enumerate(search_candidates):
+            sig_value = signatures[signal_name]
+            bits = sig_value
+            while bits:
+                lsb = bits & -bits
+                bit_index = lsb.bit_length() - 1
+                one_at_bit[bit_index] |= 1 << index
+                bits ^= lsb
+
+        def iter_set_indices(bits: int):
+            while bits:
+                lsb = bits & -bits
+                yield lsb.bit_length() - 1
+                bits ^= lsb
+
+        for left_index, left_signal in enumerate(search_candidates):
+            left_sig = signatures[left_signal]
+            if gate_type in {"and", "nand"}:
+                needed = target_sig if gate_type == "and" else (~target_sig) & mask
+                zero_required = left_sig & (~needed) & mask
+                compatible_bits = all_candidate_bits
+                bits = zero_required
+                while bits and compatible_bits:
+                    lsb = bits & -bits
+                    bit_index = lsb.bit_length() - 1
+                    compatible_bits &= ~one_at_bit[bit_index]
+                    bits ^= lsb
+            else:
+                allowed = target_sig if gate_type == "or" else (~target_sig) & mask
+                one_required = allowed & (~left_sig) & mask
+                compatible_bits = all_candidate_bits
+                bits = one_required
+                while bits and compatible_bits:
+                    lsb = bits & -bits
+                    bit_index = lsb.bit_length() - 1
+                    compatible_bits &= one_at_bit[bit_index]
+                    bits ^= lsb
+
+            # These gates are commutative, so skip mirrored pairs.
+            compatible_bits &= ~((1 << left_index) - 1)
+            for right_index in iter_set_indices(compatible_bits):
+                right_signal = search_candidates[right_index]
+                pair_checks += 1
+                if pair_checks > max_signature_pairs:
+                    return {
+                        "exists": False,
+                        "target_signal": target_signal,
+                        "gate_type": gate_type,
+                        "candidate_scope": candidate_scope,
+                        "candidate_signals": len(candidates),
+                        "signature_prefiltered_candidates": len(search_candidates),
+                        "signature_pairs_checked": pair_checks - 1,
+                        "search_complete": False,
+                        "reason": (
+                            "No matching pair found before the signature-search "
+                            f"budget of {max_signature_pairs} pairs was reached."
+                        ),
+                    }
+                if apply_sig(left_sig, signatures[right_signal]) != target_sig:
+                    continue
+                found = confirm(
+                    left_signal, right_signal, "signature_filter_then_yosys_sat", pair_checks
+                )
+                if found:
+                    return found
+
+        return {
+            "exists": False,
+            "target_signal": target_signal,
+            "gate_type": gate_type,
+            "candidate_scope": candidate_scope,
+            "candidate_signals": len(candidates),
+            "signature_prefiltered_candidates": len(search_candidates),
+            "signature_pairs_checked": pair_checks,
+            "search_complete": True,
+            "proof": "exhaustive_signature_search_with_sat_on_matches",
+        }
 
     def check_signal_constant(self, signal_name: str, value: object) -> dict:
         """Prove that a scalar or vector signal always equals a constant value."""
@@ -1960,6 +2831,14 @@ sat {' '.join(constraints)}
                 f"gate_type={gate_type or 'any'} input_count={input_count} "
                 f"has_input={has_input}\n"
             )
+            report.write("# columns: instance gate_type output inputs\n")
+            for match in matches:
+                report.write(
+                    "# "
+                    f"{match['instance']} {match['gate_type']} "
+                    f"{match['output']} {','.join(match['inputs'])}\n"
+                )
+            report.write("# jsonl:\n")
             for match in matches:
                 report.write(json.dumps(match, sort_keys=True) + "\n")
         result["sample_matches"] = matches[:inline_limit]
@@ -2837,10 +3716,185 @@ sat {' '.join(constraints)}
             "allowed_gates": effective_allowed,
         }
 
+    def _max_logic_depth(self) -> int:
+        """Return maximum combinational fanin depth over all gate outputs."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        memo: Dict[str, int] = {}
+        return max(
+            (self._fanin_depth(node.output, memo) for node in nl.nodes.values()),
+            default=0,
+        )
+
+    def _resolved_cone_root(self, output_signal: str) -> str:
+        """Resolve a DFF-Q cone request to the corresponding D input."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        dff_q_to_d = {dff.q: dff.d for dff in nl.dffs.values()}
+        return dff_q_to_d.get(output_signal, output_signal)
+
+    def _cone_gate_type_counts(self, output_signal: str) -> Dict[str, int]:
+        """Return gate-type counts in the combinational cone of output_signal."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        actual_output = self._resolved_cone_root(output_signal)
+        counts: Dict[str, int] = {}
+        for inst in self.get_logic_cone(actual_output):
+            gate_type = nl.nodes[inst].gate_type
+            counts[gate_type] = counts.get(gate_type, 0) + 1
+        return counts
+
+    def optimize_depth_preserving_cone_gate_set(
+        self,
+        output_signal: str,
+        allowed_gates: List[str],
+        verify_equivalence: bool = False,
+    ) -> dict:
+        """Optimize whole-design depth, then remap only one cone to allowed gates.
+
+        This matches prompts where the cost function is whole-design maximum
+        depth but only a named cone has a gate-set restriction.
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        self._resolve_signal(output_signal)
+
+        original_netlist = copy.deepcopy(nl)
+        original_constraint = (
+            list(self._allowed_gates_constraint)
+            if self._allowed_gates_constraint is not None
+            else None
+        )
+
+        allowed = list(dict.fromkeys(g.lower() for g in allowed_gates))
+        valid = {"nand", "nor", "or", "and", "not", "xor", "xnor", "buf"}
+        bad = sorted(set(allowed) - valid)
+        if bad:
+            raise ValueError(f"Unknown gate types in allowed_gates: {bad}")
+        if not allowed:
+            raise ValueError("allowed_gates cannot be empty.")
+
+        depth_before = self._max_logic_depth()
+        cone_before = self._cone_gate_type_counts(output_signal)
+
+        try:
+            # First pass: optimize depth with the normal unrestricted library,
+            # ignoring any previous whole-design gate-set constraint.
+            self._allowed_gates_constraint = None
+            opt_result = self.reduce_critical_path()
+            depth_after_unrestricted = self._max_logic_depth()
+
+            # Second pass: repair only the requested cone to the requested set.
+            remap_result = self.remap_cone_with_gates(output_signal, allowed)
+            if not remap_result.get("success"):
+                self._netlist = original_netlist
+                self._allowed_gates_constraint = original_constraint
+                return {
+                    "success": False,
+                    "reason": remap_result.get("reason", "Cone remap failed."),
+                    "output_signal": output_signal,
+                    "allowed_gates": allowed,
+                    "depth_before": depth_before,
+                    "depth_after_unrestricted": depth_after_unrestricted,
+                    "optimization": opt_result,
+                    "cone_remap": remap_result,
+                }
+
+            cone_after = self._cone_gate_type_counts(output_signal)
+            disallowed = {
+                gate_type: count
+                for gate_type, count in cone_after.items()
+                if gate_type not in set(allowed)
+            }
+            if disallowed:
+                self._netlist = original_netlist
+                self._allowed_gates_constraint = original_constraint
+                return {
+                    "success": False,
+                    "reason": "Cone remap left disallowed gate types.",
+                    "output_signal": output_signal,
+                    "allowed_gates": allowed,
+                    "disallowed_gate_counts": disallowed,
+                    "depth_before": depth_before,
+                    "depth_after_unrestricted": depth_after_unrestricted,
+                    "cone_before": cone_before,
+                    "cone_after": cone_after,
+                    "optimization": opt_result,
+                    "cone_remap": remap_result,
+                }
+
+            equivalence = None
+            if verify_equivalence:
+                equivalence = self.check_design_equivalence()
+                if not equivalence.get("equivalent"):
+                    self._netlist = original_netlist
+                    self._allowed_gates_constraint = original_constraint
+                    return {
+                        "success": False,
+                        "reason": "Equivalence check failed after optimization.",
+                        "output_signal": output_signal,
+                        "allowed_gates": allowed,
+                        "equivalence": equivalence,
+                        "depth_before": depth_before,
+                        "depth_after_unrestricted": depth_after_unrestricted,
+                        "cone_before": cone_before,
+                        "cone_after": cone_after,
+                        "optimization": opt_result,
+                        "cone_remap": remap_result,
+                    }
+
+            depth_after = self._max_logic_depth()
+            if depth_after >= depth_before:
+                self._netlist = original_netlist
+                self._allowed_gates_constraint = original_constraint
+                return {
+                    "success": False,
+                    "reason": "Final depth was not smaller than the input depth; restored input design.",
+                    "output_signal": output_signal,
+                    "allowed_gates": allowed,
+                    "depth_before": depth_before,
+                    "depth_after_unrestricted": depth_after_unrestricted,
+                    "depth_after": depth_after,
+                    "improvement": depth_before - depth_after,
+                    "cone_before": cone_before,
+                    "cone_after": cone_after,
+                    "optimization": opt_result,
+                    "cone_remap": remap_result,
+                    "equivalence": equivalence,
+                    "equivalence_checked": verify_equivalence,
+                    "restored_input_design": True,
+                }
+            self._allowed_gates_constraint = original_constraint
+            return {
+                "success": True,
+                "output_signal": output_signal,
+                "allowed_gates": allowed,
+                "depth_before": depth_before,
+                "depth_after_unrestricted": depth_after_unrestricted,
+                "depth_after": depth_after,
+                "improvement": depth_before - depth_after,
+                "cone_before": cone_before,
+                "cone_after": cone_after,
+                "optimization": opt_result,
+                "cone_remap": remap_result,
+                "equivalence": equivalence,
+                "equivalence_checked": verify_equivalence,
+                "restored_input_design": False,
+            }
+        except Exception:
+            self._netlist = original_netlist
+            self._allowed_gates_constraint = original_constraint
+            raise
+
     def remap_cone_with_gates(
         self,
         output_signal: str,
         allowed_gates: List[str],
+        force_abc: bool = False,
     ) -> dict:
         """Re-implement the fanin cone of output_signal using only allowed_gates.
 
@@ -2948,7 +4002,7 @@ sat {' '.join(constraints)}
             source_type: self._get_substitution_template(source_type, allowed_gates)
             for source_type in source_types
         }
-        if all(template is not None for template in templates.values()):
+        if not force_abc and all(template is not None for template in templates.values()):
             replaced = 0
             for source_type in source_types:
                 result = self.replace_gate_type_in_cone(
@@ -2977,12 +4031,18 @@ sat {' '.join(constraints)}
                 remapped_insts.add(driver)
                 stack.extend(nl.nodes[driver].inputs)
 
+            gate_types_after: Dict[str, int] = {}
+            for inst in remapped_insts:
+                gate_type = nl.nodes[inst].gate_type
+                gate_types_after[gate_type] = gate_types_after.get(gate_type, 0) + 1
+
             return {
                 "success": True,
                 "output_signal": output_signal,
                 "allowed_gates": allowed_gates,
                 "gates_before": gates_before,
                 "gates_after": len(remapped_insts),
+                "gate_types_after": dict(sorted(gate_types_after.items())),
                 "gates_replaced": replaced,
                 "strategy": "local_substitution",
             }
@@ -3256,6 +4316,7 @@ sat {' '.join(constraints)}
                 nl.wires[final_name] = WireInfo(name=final_name)
 
         self.remove_dangling_gates()
+        gate_counts = self.count_gate_types_in_cone(output_signal)
 
         return {
             "success": True,
@@ -3263,7 +4324,140 @@ sat {' '.join(constraints)}
             "allowed_gates": allowed_gates,
             "gates_before": gates_before,
             "gates_after": gates_after,
+            "gate_types_after": gate_counts.get("by_type", {}),
         }
+
+    def optimize_cone_depth_preserving_gate_set(
+        self,
+        output_signal: str,
+        allowed_gates: List[str],
+        verify_equivalence: bool = False,
+    ) -> dict:
+        """Optimize only one fanin cone for cone depth under a gate-set limit.
+
+        This is for prompts whose cost function is the depth of the named cone,
+        not whole-design maximum depth. It remaps only that cone through the
+        restricted ABC cone flow, then restores the input design if the cone
+        depth does not improve.
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        self._resolve_signal(output_signal)
+
+        original_netlist = copy.deepcopy(nl)
+        allowed = list(dict.fromkeys(g.lower() for g in allowed_gates))
+        valid = {"nand", "nor", "or", "and", "not", "xor", "xnor", "buf"}
+        bad = sorted(set(allowed) - valid)
+        if bad:
+            raise ValueError(f"Unknown gate types in allowed_gates: {bad}")
+        if not allowed:
+            raise ValueError("allowed_gates cannot be empty.")
+
+        dff_q_to_d = {dff.q: dff.d for dff in nl.dffs.values()}
+        if output_signal in dff_q_to_d:
+            return {
+                "success": False,
+                "reason": (
+                    f"{output_signal} is a DFF Q output and is treated as a "
+                    "combinational primary-input boundary; its fanin cone depth is 0."
+                ),
+                "output_signal": output_signal,
+                "allowed_gates": allowed,
+                "depth_before": 0,
+                "depth_after": 0,
+                "improvement": 0,
+                "cone_before": {},
+                "cone_after": {},
+                "equivalence_checked": False,
+                "restored_input_design": False,
+            }
+
+        depth_before = int(self.get_fanin_cone_depth(output_signal)["depth"])
+        cone_before = self._cone_gate_type_counts(output_signal)
+
+        try:
+            remap_result = self.remap_cone_with_gates(
+                output_signal,
+                allowed,
+                force_abc=False,
+            )
+            if not remap_result.get("success"):
+                self._netlist = original_netlist
+                return {
+                    "success": False,
+                    "reason": remap_result.get("reason", "Cone remap failed."),
+                    "output_signal": output_signal,
+                    "allowed_gates": allowed,
+                    "depth_before": depth_before,
+                    "cone_before": cone_before,
+                    "cone_remap": remap_result,
+                    "restored_input_design": True,
+                }
+
+            cone_after = self._cone_gate_type_counts(output_signal)
+            disallowed = {
+                gate_type: count
+                for gate_type, count in cone_after.items()
+                if gate_type not in set(allowed)
+            }
+            if disallowed:
+                self._netlist = original_netlist
+                return {
+                    "success": False,
+                    "reason": "Cone remap left disallowed gate types.",
+                    "output_signal": output_signal,
+                    "allowed_gates": allowed,
+                    "depth_before": depth_before,
+                    "cone_before": cone_before,
+                    "cone_after": cone_after,
+                    "disallowed_gate_counts": disallowed,
+                    "cone_remap": remap_result,
+                    "restored_input_design": True,
+                }
+
+            depth_after = int(self.get_fanin_cone_depth(output_signal)["depth"])
+            if depth_after >= depth_before:
+                self._netlist = original_netlist
+                return {
+                    "success": False,
+                    "reason": "Cone depth was not smaller than the input cone; restored input design.",
+                    "output_signal": output_signal,
+                    "allowed_gates": allowed,
+                    "depth_before": depth_before,
+                    "depth_after": depth_after,
+                    "improvement": depth_before - depth_after,
+                    "cone_before": cone_before,
+                    "cone_after": cone_after,
+                    "cone_remap": remap_result,
+                    "equivalence_checked": False,
+                    "equivalence_note": (
+                        "Cone-local formal equivalence is not implemented; the ABC remap "
+                        "is used as a functional-preserving synthesis transform."
+                    ) if verify_equivalence else None,
+                    "restored_input_design": True,
+                }
+
+            return {
+                "success": True,
+                "output_signal": output_signal,
+                "allowed_gates": allowed,
+                "depth_before": depth_before,
+                "depth_after": depth_after,
+                "improvement": depth_before - depth_after,
+                "cone_before": cone_before,
+                "cone_after": cone_after,
+                "cone_remap": remap_result,
+                "equivalence_checked": False,
+                "equivalence_note": (
+                    "Cone-local formal equivalence is not implemented; the ABC remap "
+                    "is used as a functional-preserving synthesis transform."
+                ) if verify_equivalence else None,
+                "restored_input_design": False,
+            }
+        except Exception:
+            self._netlist = original_netlist
+            raise
 
     def remap_design_with_gates(self, allowed_gates: List[str]) -> dict:
         """Rebuild every combinational gate using only ``allowed_gates``.
@@ -3496,37 +4690,107 @@ sat {' '.join(constraints)}
         # ABC's map command requires an inverter cell; when 'not' is absent
         # from target_types, self-tied NAND/NOR are the only option and ABC
         # crashes. We provide these trivially-known templates directly.
+        def tmpl(inputs: List[str], gates: List[Tuple[str, List[str], str]]) -> dict:
+            internal_wires = [
+                output
+                for _gate_type, _gate_inputs, output in gates
+                if output != "Y"
+            ]
+            return {
+                "inputs": inputs,
+                "output": "Y",
+                "gates": [
+                    GateNode(f"_t{idx}", gate_type, gate_inputs, output)
+                    for idx, (gate_type, gate_inputs, output) in enumerate(gates)
+                ],
+                "internal_wires": internal_wires,
+            }
+
         _hardcoded: Dict[Tuple, dict] = {
-            # not → nand(A,A)
-            ("not", frozenset({"nand"})): {
-                "inputs": ["A"], "output": "Y",
-                "gates": [GateNode("_t0", "nand", ["A", "A"], "Y")],
-                "internal_wires": [],
-            },
-            # not → nor(A,A)
-            ("not", frozenset({"nor"})): {
-                "inputs": ["A"], "output": "Y",
-                "gates": [GateNode("_t0", "nor", ["A", "A"], "Y")],
-                "internal_wires": [],
-            },
-            # buf → not(not(A))
-            ("buf", frozenset({"not"})): {
-                "inputs": ["A"], "output": "Y",
-                "gates": [
-                    GateNode("_t0", "not", ["A"],    "_w0"),
-                    GateNode("_t1", "not", ["_w0"],  "Y"),
-                ],
-                "internal_wires": ["_w0"],
-            },
-            # buf → nand(nand(A,A),nand(A,A))  [double inversion]
-            ("buf", frozenset({"nand"})): {
-                "inputs": ["A"], "output": "Y",
-                "gates": [
-                    GateNode("_t0", "nand", ["A",   "A"],    "_w0"),
-                    GateNode("_t1", "nand", ["_w0", "_w0"],  "Y"),
-                ],
-                "internal_wires": ["_w0"],
-            },
+            # NAND-only templates. NAND(A,A) supplies inversion.
+            ("not", frozenset({"nand"})): tmpl(["A"], [
+                ("nand", ["A", "A"], "Y"),
+            ]),
+            ("buf", frozenset({"nand"})): tmpl(["A"], [
+                ("nand", ["A", "A"], "_w0"),
+                ("nand", ["_w0", "_w0"], "Y"),
+            ]),
+            ("and", frozenset({"nand"})): tmpl(["A", "B"], [
+                ("nand", ["A", "B"], "_w0"),
+                ("nand", ["_w0", "_w0"], "Y"),
+            ]),
+            ("nand", frozenset({"nand"})): tmpl(["A", "B"], [
+                ("nand", ["A", "B"], "Y"),
+            ]),
+            ("or", frozenset({"nand"})): tmpl(["A", "B"], [
+                ("nand", ["A", "A"], "_w0"),
+                ("nand", ["B", "B"], "_w1"),
+                ("nand", ["_w0", "_w1"], "Y"),
+            ]),
+            ("nor", frozenset({"nand"})): tmpl(["A", "B"], [
+                ("nand", ["A", "A"], "_w0"),
+                ("nand", ["B", "B"], "_w1"),
+                ("nand", ["_w0", "_w1"], "_w2"),
+                ("nand", ["_w2", "_w2"], "Y"),
+            ]),
+            ("xor", frozenset({"nand"})): tmpl(["A", "B"], [
+                ("nand", ["A", "B"], "_w0"),
+                ("nand", ["A", "_w0"], "_w1"),
+                ("nand", ["B", "_w0"], "_w2"),
+                ("nand", ["_w1", "_w2"], "Y"),
+            ]),
+            ("xnor", frozenset({"nand"})): tmpl(["A", "B"], [
+                ("nand", ["A", "B"], "_w0"),
+                ("nand", ["A", "_w0"], "_w1"),
+                ("nand", ["B", "_w0"], "_w2"),
+                ("nand", ["_w1", "_w2"], "_w3"),
+                ("nand", ["_w3", "_w3"], "Y"),
+            ]),
+
+            # NOR-only templates. NOR(A,A) supplies inversion.
+            ("not", frozenset({"nor"})): tmpl(["A"], [
+                ("nor", ["A", "A"], "Y"),
+            ]),
+            ("buf", frozenset({"nor"})): tmpl(["A"], [
+                ("nor", ["A", "A"], "_w0"),
+                ("nor", ["_w0", "_w0"], "Y"),
+            ]),
+            ("or", frozenset({"nor"})): tmpl(["A", "B"], [
+                ("nor", ["A", "B"], "_w0"),
+                ("nor", ["_w0", "_w0"], "Y"),
+            ]),
+            ("nor", frozenset({"nor"})): tmpl(["A", "B"], [
+                ("nor", ["A", "B"], "Y"),
+            ]),
+            ("and", frozenset({"nor"})): tmpl(["A", "B"], [
+                ("nor", ["A", "A"], "_w0"),
+                ("nor", ["B", "B"], "_w1"),
+                ("nor", ["_w0", "_w1"], "Y"),
+            ]),
+            ("nand", frozenset({"nor"})): tmpl(["A", "B"], [
+                ("nor", ["A", "A"], "_w0"),
+                ("nor", ["B", "B"], "_w1"),
+                ("nor", ["_w0", "_w1"], "_w2"),
+                ("nor", ["_w2", "_w2"], "Y"),
+            ]),
+            ("xnor", frozenset({"nor"})): tmpl(["A", "B"], [
+                ("nor", ["A", "B"], "_w0"),
+                ("nor", ["A", "_w0"], "_w1"),
+                ("nor", ["B", "_w0"], "_w2"),
+                ("nor", ["_w1", "_w2"], "Y"),
+            ]),
+            ("xor", frozenset({"nor"})): tmpl(["A", "B"], [
+                ("nor", ["A", "B"], "_w0"),
+                ("nor", ["A", "_w0"], "_w1"),
+                ("nor", ["B", "_w0"], "_w2"),
+                ("nor", ["_w1", "_w2"], "_w3"),
+                ("nor", ["_w3", "_w3"], "Y"),
+            ]),
+            # buf -> not(not(A))
+            ("buf", frozenset({"not"})): tmpl(["A"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["_w0"], "Y"),
+            ]),
         }
         # Also support nand+not or nor+not for "not" target (just use not directly — no-op)
         # Actually mapping "not" to {"not"} is trivially identity — skip.
@@ -3652,8 +4916,8 @@ sat {' '.join(constraints)}
             return {
                 "success": False,
                 "reason": (
-                    f"ABC could not map '{source_type}' using only {target_types}. "
-                    f"The target gate set may not be functionally complete for this operation."
+                    f"No substitution template is available for '{source_type}' "
+                    f"using only {target_types}."
                 ),
                 "replaced": 0, "skipped": 0,
             }
@@ -3662,6 +4926,12 @@ sat {' '.join(constraints)}
         tmpl_output       = template["output"]        # e.g. "Y"
         tmpl_gates        = template["gates"]         # List[GateNode]
         tmpl_int_wires    = template["internal_wires"]
+        gate_counts_before = self.count_gates().get("breakdown", {})
+        replacement_gate_types: Dict[str, int] = {}
+        for tg in tmpl_gates:
+            if tg.gate_type == "buf" and "buf" not in target_types:
+                continue
+            replacement_gate_types[tg.gate_type] = replacement_gate_types.get(tg.gate_type, 0) + 1
 
         # ---- 2. Collect target gate instances ----
         if output_signal is None or output_signal == "*":
@@ -3718,6 +4988,10 @@ sat {' '.join(constraints)}
                 "source_type": source_type,
                 "target_types": target_types,
                 "output_signal": output_signal,
+                "gate_counts_before": gate_counts_before,
+                "gate_counts_after": gate_counts_before,
+                "replacement_gate_types": replacement_gate_types,
+                "delta_by_type": {},
             }
 
         # ---- 3. Apply template to each matching gate ----
@@ -3798,6 +5072,14 @@ sat {' '.join(constraints)}
 
             replaced += 1
 
+        gate_counts_after = self.count_gates().get("breakdown", {})
+        all_gate_types = set(gate_counts_before) | set(gate_counts_after)
+        delta_by_type = {
+            gate_type: gate_counts_after.get(gate_type, 0) - gate_counts_before.get(gate_type, 0)
+            for gate_type in sorted(all_gate_types)
+            if gate_counts_after.get(gate_type, 0) != gate_counts_before.get(gate_type, 0)
+        }
+
         return {
             "success": True,
             "replaced": replaced,
@@ -3805,6 +5087,10 @@ sat {' '.join(constraints)}
             "source_type":   source_type,
             "target_types":  target_types,
             "output_signal": output_signal,
+            "replacement_gate_types": replacement_gate_types,
+            "delta_by_type": delta_by_type,
+            "gate_counts_before": gate_counts_before,
+            "gate_counts_after": gate_counts_after,
         }
 
     def collapse_inverter_pairs(self) -> dict:

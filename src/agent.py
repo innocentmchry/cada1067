@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal as _signal
 import time
 from pathlib import Path
@@ -57,14 +58,24 @@ _SYSTEM_PROMPT = (
     "history or the user explicitly requests recomputation or current-state analysis. "
     "For numerical or statistical design queries whose answer is not already explicit in "
     "the ordered context history, use tools instead of estimating. Tool results may be "
-    "compacted to save tokens; when a result includes a count and file_path, report the "
-    "count and file path instead of requesting the full inline list. For constant "
+    "compacted to save tokens; when a tool result includes a file_path, always report "
+    "that exact file path to the user along with the count instead of saying the full "
+    "list is too long or can be found in the design. For constant "
     "propagation of gates with tied constant inputs, or prompts referring to reported "
     "gates, use find_gates results and replace_gate with explicit new_inputs for only "
     "those instances. If the relevant prior find_gates summary says zero gates were "
     "found, report that there is nothing to simplify. Do not use replace_gate_type_in_cone "
     "for constant propagation or reported-gate simplification; it is only for intentional "
-    "gate-library remapping of all gates of a type in a scope."
+    "gate-library remapping of all gates of a type in a scope. For questions asking "
+    "whether there exists a pair of existing signals a,b such that a binary gate "
+    "expression like NAND(a,b), OR(a,b), or XOR(a,b) equals a target signal, use "
+    "find_binary_gate_equivalent_pair; do not approximate this by listing existing "
+    "gates of that type. For prompts asking to list flip-flops driven or clocked by "
+    "a named clock signal, use list_flip_flops_by_clock. For depth optimization "
+    "where only one named cone must use a restricted gate set and the cost is whole-design "
+    "maximum depth, use optimize_depth_preserving_cone_gate_set; when the cost is the "
+    "depth of that cone itself, use optimize_cone_depth_preserving_gate_set; "
+    "reduce_critical_path with allowed_gates is only for restricting the whole design."
 )
 
 # Timeouts (seconds) per category
@@ -208,6 +219,32 @@ class EDAAgent:
         self._context_history.append(summary)
         self._trim_context_history()
 
+    def _request_context_summary(
+        self, user_message: str, tool_summaries: List[str]
+    ) -> Optional[str]:
+        """Condense all tool calls from one user prompt into one history item."""
+        if not tool_summaries:
+            return None
+
+        prompt = " ".join(user_message.split())
+        max_prompt_chars = 120
+        if len(prompt) > max_prompt_chars:
+            prompt = prompt[: max_prompt_chars - 3] + "..."
+
+        counts: Dict[str, int] = {}
+        ordered: List[str] = []
+        for summary in tool_summaries:
+            if summary not in counts:
+                ordered.append(summary)
+                counts[summary] = 0
+            counts[summary] += 1
+
+        details = [
+            f"{summary} ({counts[summary]}x)" if counts[summary] > 1 else summary
+            for summary in ordered
+        ]
+        return f"{prompt} => " + "; ".join(details)
+
     @staticmethod
     def _parse_replace_gate_summary(summary: str) -> Optional[tuple[int, str]]:
         prefix = "replace_gate: "
@@ -233,6 +270,63 @@ class EDAAgent:
         if first_type != second_type:
             return None
         return f"replace_gate: {first_count + second_count} gate(s) -> {first_type}"
+
+    def _specific_gate_type_replacement_from_prompt(self) -> Optional[str]:
+        """Infer a named source gate type for narrow cone replacement prompts."""
+        prompt = getattr(self, "_active_user_message", "").lower()
+        if not any(word in prompt for word in ("replace", "convert")):
+            return None
+        if "cone" not in prompt:
+            return None
+        for gate_type in ("nand", "nor", "xnor", "xor", "and", "or", "buf", "not"):
+            source_patterns = (
+                rf"\b(?:replace|convert)\s+(?:all\s+)?(?:2-input|two-input)?\s*{gate_type}\s+gates?\b",
+                rf"\b(?:replace|convert)\s+(?:all\s+)?(?:2-input|two-input)?\s*{gate_type}-gates?\b",
+                rf"\b(?:replace|convert)\s+(?:all\s+)?gates?\s+of\s+type\s+{gate_type}\b",
+            )
+            if any(re.search(pattern, prompt) for pattern in source_patterns):
+                return gate_type
+        return None
+
+    def _cone_depth_restriction_target_from_prompt(self) -> Optional[str]:
+        """Infer the cone target for depth prompts with a cone-only gate restriction."""
+        prompt = getattr(self, "_active_user_message", "")
+        if "cone" not in prompt.lower():
+            return None
+        if not any(word in prompt.lower() for word in ("depth", "critical path", "maximum path")):
+            return None
+        match = re.search(r"\bcone\s+of\s+([A-Za-z_$][\w$]*(?:\[[^\]]+\])?)", prompt, re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1)
+
+    def _cone_allowed_gates_from_prompt(self) -> Optional[List[str]]:
+        """Infer an allowed gate set from phrases like 'only NOR and NOT gates'."""
+        prompt = getattr(self, "_active_user_message", "")
+        match = re.search(r"\bonly\s+(.+?)\s+gates?\b", prompt, re.IGNORECASE)
+        if not match:
+            return None
+        phrase = match.group(1)
+        parts = re.split(r"\s*,\s*|\s+and\s+", phrase, flags=re.IGNORECASE)
+        valid = {"nand", "nor", "or", "and", "not", "xor", "xnor", "buf"}
+        gates: List[str] = []
+        for part in parts:
+            gate = part.strip().lower()
+            if gate.startswith("and "):
+                gate = gate[4:].strip()
+            if gate in valid and gate not in gates:
+                gates.append(gate)
+        return gates or None
+
+    def _prompt_uses_cone_depth_cost(self) -> bool:
+        """Return True when the prompt optimizes the named cone's own depth."""
+        prompt = getattr(self, "_active_user_message", "").lower()
+        return (
+            "depth of the cone" in prompt
+            or "cone depth" in prompt
+            or "cost function is the depth of the cone" in prompt
+            or "cost function is depth of the cone" in prompt
+        )
 
     def _compact_tool_result_for_llm(self, result_str: str) -> str:
         """Shrink a tool result before feeding it back to the LLM."""
@@ -320,6 +414,26 @@ class EDAAgent:
                 f"{data.get('primary_input_ports')} PI ports, "
                 f"{data.get('primary_output_ports')} PO ports"
             )
+        elif tool_name == "list_primary_ios":
+            return (
+                f"list_primary_ios: "
+                f"{data.get('primary_input_ports')} PI ports/"
+                f"{data.get('primary_input_bits')} bits, "
+                f"{data.get('primary_output_ports')} PO ports/"
+                f"{data.get('primary_output_bits')} bits"
+            )
+        elif tool_name == "count_gate_types_in_cone":
+            by_type = data.get("by_type", {})
+            parts = ", ".join(
+                f"{count}x {gate_type.upper()}"
+                for gate_type, count in sorted(by_type.items())
+            )
+            sig = data.get("output_signal", "?")
+            total = data.get("total", 0)
+            return (
+                f"count_gate_types_in_cone: cone of {sig} has {total} gates"
+                + (f" ({parts})" if parts else "")
+            )
         elif tool_name == "find_gates":
             count = data.get("count", 0)
             gate_type = data.get("gate_type")
@@ -370,6 +484,14 @@ class EDAAgent:
                 f"{data.get('source')}->{data.get('sink')} via "
                 f"{data.get('through')} ({path_state})"
             )
+        elif tool_name == "is_wire_cut_between_primary_ios":
+            answer = "YES" if data.get("is_cut_between_primary_io") else "NO"
+            return (
+                f"is_wire_cut_between_primary_ios: {answer} for "
+                f"{data.get('wire')} "
+                f"(on PI-to-PO path: "
+                f"{'YES' if data.get('is_on_any_pi_po_path') else 'NO'})"
+            )
         elif tool_name == "is_gate_on_any_max_depth_path":
             return (
                 f"is_gate_on_any_max_depth_path: {data.get('gate')} "
@@ -398,6 +520,14 @@ class EDAAgent:
             if data.get("file_path"):
                 summary += f"; full list in {data['file_path']}"
             return summary
+        elif tool_name == "find_zero_length_pi_po_paths":
+            paths = data.get("paths", [])
+            names = [p.get("source") for p in paths[:5] if isinstance(p, dict)]
+            detail = f": {', '.join(names)}" if names else ""
+            return (
+                f"find_zero_length_pi_po_paths: found "
+                f"{data.get('count', 0)} direct PI-to-PO wire path(s){detail}"
+            )
         elif tool_name == "find_register_to_register_paths":
             summary = f"find_register_to_register_paths: {data.get('count', 0)} paths"
             if data.get("file_path"):
@@ -466,10 +596,25 @@ class EDAAgent:
                 src   = data.get("source_type", "?")
                 tgt   = data.get("target_types", [])
                 scope = data.get("output_signal") or "whole design"
+                before_counts = data.get("gate_counts_before", {})
+                after_counts = data.get("gate_counts_after", {})
+                changed_types = [src]
+                changed_types.extend(tgt if isinstance(tgt, list) else [])
+                count_parts = []
+                for gate_type in sorted(set(changed_types)):
+                    key = str(gate_type).upper()
+                    before_count = before_counts.get(key, before_counts.get(gate_type))
+                    after_count = after_counts.get(key, after_counts.get(gate_type))
+                    if before_count is not None and after_count is not None:
+                        count_parts.append(
+                            f"{key} {before_count}→{after_count}"
+                        )
+                count_detail = f"; {', '.join(count_parts)}" if count_parts else ""
                 return (
                     f"replace_gate_type_in_cone: replaced {replaced}x '{src}' with {tgt} "
                     f"in cone of {scope}" +
-                    (f" ({skipped} skipped)" if skipped else "")
+                    (f" ({skipped} skipped)" if skipped else "") +
+                    count_detail
                 )
             else:
                 return f"replace_gate_type_in_cone: FAILED — {data.get('reason', 'unknown error')}"
@@ -480,7 +625,13 @@ class EDAAgent:
                 after  = data.get("gates_after", "?")
                 sig    = data.get("output_signal", "?")
                 gates  = data.get("allowed_gates", [])
-                return f"remap_cone_with_gates: cone of {sig} remapped to {gates} — {before} gates → {after} gates"
+                by_type = data.get("gate_types_after", {})
+                parts = ", ".join(
+                    f"{count}x {gate_type.upper()}"
+                    for gate_type, count in sorted(by_type.items())
+                )
+                detail = f" ({parts})" if parts else ""
+                return f"remap_cone_with_gates: cone of {sig} remapped to {gates} — {before} gates → {after} gates{detail}"
             else:
                 return f"remap_cone_with_gates: FAILED — {data.get('reason', 'unknown error')}"
         elif tool_name == "remap_design_with_gates":
@@ -501,6 +652,36 @@ class EDAAgent:
             return f"fraig_merge_equivalent_gates: FAILED"
         elif tool_name == "check_signal_equivalence":
             return f"check_signal_equivalence: equivalent={data.get('equivalent')}"
+        elif tool_name == "find_binary_gate_equivalent_pair":
+            if data.get("exists"):
+                return (
+                    f"find_binary_gate_equivalent_pair: YES, "
+                    f"{data.get('gate_type', '?').upper()}({data.get('a')}, {data.get('b')}) "
+                    f"is equivalent to {data.get('target_signal')} "
+                    f"({data.get('proof', 'confirmed')})"
+                )
+            completeness = "complete" if data.get("search_complete") else "incomplete"
+            return (
+                f"find_binary_gate_equivalent_pair: NO proven pair for "
+                f"{data.get('gate_type', '?').upper()}(_, _) equivalent to "
+                f"{data.get('target_signal')} ({completeness} search)"
+            )
+        elif tool_name == "list_flip_flops_by_clock":
+            summary = (
+                f"list_flip_flops_by_clock: found {data.get('count', 0)} "
+                f"DFF(s) clocked by {data.get('clock_signal')}"
+            )
+            samples = data.get("flip_flops") or data.get("sample_flip_flops") or []
+            sample_names = [
+                item.get("instance")
+                for item in samples[:5]
+                if isinstance(item, dict) and item.get("instance")
+            ]
+            if sample_names:
+                summary += f": {', '.join(sample_names)}"
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            return summary
         elif tool_name == "check_signal_constant":
             answer = "yes" if data.get("always_equal") else "no"
             return (
@@ -522,6 +703,43 @@ class EDAAgent:
             restriction = data.get('allowed_gates')
             restricted = f" using only {restriction}" if restriction else ""
             return f"reduce_critical_path: depth {before} → {after} (improved by {imp}){restricted} {'OK' if ok else 'NO IMPROVEMENT'}"
+        elif tool_name == "optimize_depth_preserving_cone_gate_set":
+            before = data.get("depth_before", "?")
+            after_unrestricted = data.get("depth_after_unrestricted", "?")
+            after = data.get("depth_after", "?")
+            imp = data.get("improvement", "?")
+            sig = data.get("output_signal", "?")
+            gates = data.get("allowed_gates", [])
+            status = "OK" if data.get("success", False) else "NO IMPROVEMENT"
+            if not data.get("success", False) and data.get("reason"):
+                status = f"FAILED: {data.get('reason')}"
+            if data.get("restored_input_design"):
+                status += "; input design restored"
+            return (
+                "optimize_depth_preserving_cone_gate_set: "
+                f"depth {before} → {after_unrestricted} unrestricted → {after} final "
+                f"(improved by {imp}); cone of {sig} restricted to {gates} {status}"
+            )
+        elif tool_name == "optimize_cone_depth_preserving_gate_set":
+            before = data.get("depth_before", "?")
+            after = data.get("depth_after", "?")
+            imp = data.get("improvement", "?")
+            sig = data.get("output_signal", "?")
+            gates = data.get("allowed_gates", [])
+            status = "OK" if data.get("success", False) else "NO IMPROVEMENT"
+            if (
+                not data.get("success", False)
+                and data.get("reason")
+                and not data.get("restored_input_design")
+            ):
+                status = f"FAILED: {data.get('reason')}"
+            if data.get("restored_input_design"):
+                status = "NO IMPROVEMENT; input design restored"
+            return (
+                "optimize_cone_depth_preserving_gate_set: "
+                f"cone {sig} depth {before} → {after} "
+                f"(improved by {imp}); restricted to {gates} {status}"
+            )
         else:
             return f"{tool_name} completed"
 
@@ -563,6 +781,17 @@ class EDAAgent:
             EDAAgent._request_counter, self._logs_dir, self._model, label=label
         ) as conv_log:
             self._active_user_message = user_message
+            request_tool_summaries: List[str] = []
+
+            def finish(final_text: str) -> str:
+                request_summary = self._request_context_summary(
+                    user_message, request_tool_summaries
+                )
+                if request_summary:
+                    self._append_context_summary(request_summary)
+                conv_log.log_final_response(final_text)
+                return final_text
+
             conv_log.log_user_input(user_message)
             if context_summary and self._developer_mode:
                 conv_log._fh.write(
@@ -603,9 +832,14 @@ class EDAAgent:
                             f"limit ({self._max_tool_rounds}) to avoid excessive token use. "
                             "The last tool result is available in the developer log."
                         )
-                        conv_log.log_final_response(final_text)
-                        return final_text
+                        return finish(final_text)
                     tool_rounds += 1
+
+                    tool_call_names = [tc.function.name for tc in msg.tool_calls]
+                    skip_reduce_for_cone_depth = (
+                        "reduce_critical_path" in tool_call_names
+                        and "optimize_depth_preserving_cone_gate_set" in tool_call_names
+                    )
 
                     # Dispatch each tool call
                     for tc in msg.tool_calls:
@@ -620,9 +854,34 @@ class EDAAgent:
                                 "This guard prevents repeated token spend when a tool "
                                 "result is not resolving the request."
                             )
-                            conv_log.log_final_response(final_text)
-                            return final_text
+                            return finish(final_text)
                         seen_tool_calls.add(call_signature)
+
+                        if skip_reduce_for_cone_depth and tool_name == "reduce_critical_path":
+                            result_str = json.dumps(
+                                {
+                                    "result": {
+                                        "skipped": True,
+                                        "reason": (
+                                            "Skipped because optimize_depth_preserving_cone_gate_set "
+                                            "was also called in this tool batch and supersedes "
+                                            "reduce_critical_path for cone-restricted depth optimization."
+                                        ),
+                                    }
+                                }
+                            )
+                            conv_log.log_tool_result(tool_name, result_str)
+                            request_tool_summaries.append(
+                                self._summarize_tool_result(tool_name, result_str)
+                            )
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": result_str,
+                                }
+                            )
+                            continue
 
                         op_timeout = (
                             _FAST_TIMEOUT if tool_name in _FAST_OPS else _SLOW_TIMEOUT
@@ -636,7 +895,7 @@ class EDAAgent:
                         summary = self._summarize_tool_result(
                             tool_name, result_str
                         )
-                        self._append_context_summary(summary)
+                        request_tool_summaries.append(summary)
 
                         # If a design was just loaded, dump the netlist to the log
                         if tool_name == "read_design":
@@ -655,8 +914,7 @@ class EDAAgent:
                 else:
                     # Final text response
                     final_text = msg.content or ""
-                    conv_log.log_final_response(final_text)
-                    return final_text
+                    return finish(final_text)
 
     # ------------------------------------------------------------------
     # Internal: LLM call
@@ -763,6 +1021,9 @@ class EDAAgent:
         if tool_name == "count_primary_ios":
             return eng.count_primary_ios()
 
+        if tool_name == "list_primary_ios":
+            return eng.list_primary_ios()
+
 
         if tool_name == "set_testcase_name":
             case_name: str = args["case_name"]
@@ -800,6 +1061,9 @@ class EDAAgent:
                 args["source"], args["sink"], args["node"]
             )
 
+        if tool_name == "is_wire_cut_between_primary_ios":
+            return eng.is_wire_cut_between_primary_ios(args["wire_name"])
+
         if tool_name == "find_path_avoiding":
             path = eng.find_path_avoiding(
                 args["source"], args["sink"], args["avoid"]
@@ -813,12 +1077,18 @@ class EDAAgent:
         if tool_name == "count_cone_gates":
             count = eng.count_cone_gates(args["output_signal"])
             return {"count": count}
+
+        if tool_name == "count_gate_types_in_cone":
+            return eng.count_gate_types_in_cone(args["output_signal"])
+
         if tool_name == "find_all_paths":
             return eng.find_all_paths(
                 args["source"],
                 args["sink"],
                 args.get("inline_limit") or 5,
             )
+        if tool_name == "find_zero_length_pi_po_paths":
+            return eng.find_zero_length_pi_po_paths()
         if tool_name == "find_register_to_register_paths":
             return eng.find_register_to_register_paths()
         if tool_name == "resolve_name_type":
@@ -845,6 +1115,12 @@ class EDAAgent:
         if tool_name == "are_same_clock_domain":
             same = eng.are_same_clock_domain(args["dff1"], args["dff2"])
             return {"same_clock_domain": same}
+
+        if tool_name == "list_flip_flops_by_clock":
+            return eng.list_flip_flops_by_clock(
+                args["clock_signal"],
+                int(args.get("inline_limit", 50)),
+            )
 
         if tool_name == "insert_gate_before":
             new_inst = eng.insert_gate_before(
@@ -938,7 +1214,42 @@ class EDAAgent:
             return eng.collapse_inverter_pairs()
 
         if tool_name == "reduce_critical_path":
+            cone_target = self._cone_depth_restriction_target_from_prompt()
+            cone_allowed = args.get("allowed_gates") or self._cone_allowed_gates_from_prompt()
+            if cone_target and cone_allowed:
+                prompt = getattr(self, "_active_user_message", "").lower()
+                if self._prompt_uses_cone_depth_cost():
+                    return eng.optimize_cone_depth_preserving_gate_set(
+                        cone_target,
+                        cone_allowed,
+                        any(word in prompt for word in ("equivalence", "functionally", "functionality")),
+                    )
+                return eng.optimize_depth_preserving_cone_gate_set(
+                    cone_target,
+                    cone_allowed,
+                    any(word in prompt for word in ("equivalence", "functionally", "functionality")),
+                )
             return eng.reduce_critical_path(args.get("allowed_gates"))
+
+        if tool_name == "optimize_depth_preserving_cone_gate_set":
+            if self._prompt_uses_cone_depth_cost():
+                return eng.optimize_cone_depth_preserving_gate_set(
+                    args["output_signal"],
+                    args["allowed_gates"],
+                    bool(args.get("verify_equivalence", False)),
+                )
+            return eng.optimize_depth_preserving_cone_gate_set(
+                args["output_signal"],
+                args["allowed_gates"],
+                bool(args.get("verify_equivalence", False)),
+            )
+
+        if tool_name == "optimize_cone_depth_preserving_gate_set":
+            return eng.optimize_cone_depth_preserving_gate_set(
+                args["output_signal"],
+                args["allowed_gates"],
+                bool(args.get("verify_equivalence", False)),
+            )
 
         if tool_name == "replace_gate_type_in_cone":
             return eng.replace_gate_type_in_cone(
@@ -948,6 +1259,13 @@ class EDAAgent:
             )
 
         if tool_name == "remap_cone_with_gates":
+            source_type = self._specific_gate_type_replacement_from_prompt()
+            if source_type:
+                return eng.replace_gate_type_in_cone(
+                    source_type,
+                    args["allowed_gates"],
+                    args["output_signal"],
+                )
             return eng.remap_cone_with_gates(
                 args["output_signal"],
                 args["allowed_gates"],
@@ -978,6 +1296,15 @@ class EDAAgent:
         if tool_name == "check_signal_equivalence":
             equiv = eng.check_signal_equivalence(args["sig1"], args["sig2"])
             return {"equivalent": equiv}
+
+        if tool_name == "find_binary_gate_equivalent_pair":
+            return eng.find_binary_gate_equivalent_pair(
+                args["target_signal"],
+                args["gate_type"],
+                args.get("candidate_scope", "internal"),
+                int(args.get("max_signature_pairs", 50_000_000)),
+                int(args.get("max_formal_checks", 3)),
+            )
 
         if tool_name == "check_signal_constant":
             return eng.check_signal_constant(args["signal_name"], args["value"])

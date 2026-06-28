@@ -235,6 +235,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "pass through a specific intermediate node. The node may be either a signal "
                 "name or a combinational gate instance such as g0. Use this exact tool for "
                 "prompts like 'Does every path from input n2 to output n12 pass through gate g0?'. "
+                "Do not use this for prompts asking whether a wire is a cut between any "
+                "primary input and any primary output; use is_wire_cut_between_primary_ios. "
                 "The result reports whether any source-to-sink path exists, whether all such "
                 "paths pass through the node, and a counterexample path when one avoids it."
             ),
@@ -249,6 +251,31 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["source", "sink", "node"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "is_wire_cut_between_primary_ios",
+            "description": (
+                "Determine whether a wire/signal is a cut between any primary input and any "
+                "primary output. Use this exact tool for prompts like 'Determine whether wire "
+                "n55104 is a cut between any primary input and any primary output. Report yes "
+                "or no.' This expands bus PI/PO ports to bits, treats DFF boundaries as cuts, "
+                "does not enumerate all paths, and never requires literal source='PI' or "
+                "sink='PO'. The returned answer is yes iff blocking the wire disconnects at "
+                "least one expanded PI bit from at least one expanded PO bit."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "wire_name": {
+                        "type": "string",
+                        "description": "Wire or signal name to test, such as n55104.",
+                    },
+                },
+                "required": ["wire_name"],
             },
         },
     },
@@ -301,7 +328,8 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "count_cone_gates",
             "description": (
                 "Call this to count the number of gates in the logic cone of an output signal. "
-                "Returns an integer gate count."
+                "Returns an integer gate count. Do not use this for counts by gate type "
+                "such as 'how many NAND gates in the cone'; use count_gate_types_in_cone instead."
             ),
             "parameters": {
                 "type": "object",
@@ -318,9 +346,52 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "count_gate_types_in_cone",
+            "description": (
+                "Count gates by gate type in the logic cone of an output signal. Use this "
+                "for prompts such as 'How many NAND gates are in the restructured cone of n8?' "
+                "or any cone question asking for AND/OR/NOT/NAND/NOR/XOR/XNOR/BUF counts. "
+                "Returns total and a by_type dictionary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string",
+                        "description": "The output net whose logic cone should be counted.",
+                    }
+                },
+                "required": ["output_signal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_zero_length_pi_po_paths",
+            "description": (
+                "Find all paths of length 0 from primary inputs to primary outputs, i.e. "
+                "direct wire connections where the same signal is both a PI and a PO and "
+                "no gates are traversed. Use this exact tool for prompts like 'Find all "
+                "paths of length 0 (direct wire connections from PI to PO)'. Do not call "
+                "find_all_paths with literal source='PI' or sink='PO' for this request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_all_paths",
             "description": (
                 "List all combinational paths between a source signal and sink signal. "
+                "Use only when both source and sink are concrete signal names. Do not pass "
+                "literal strings PI or PO, and do not use this for 'paths of length 0' "
+                "from any PI to any PO; use find_zero_length_pi_po_paths for that. "
                 "Only the first 5 paths are returned inline by default. If more than "
                 "5 paths exist, the complete path list is written to a text file under "
                 "./_tmp/ and the result returns the file_path. There is no artificial "
@@ -522,6 +593,33 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["dff1", "dff2"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_flip_flops_by_clock",
+            "description": (
+                "List all flip-flop/DFF instances whose clock pin is exactly the given "
+                "clock signal. Use this exact tool for prompts like 'List all flip-flops "
+                "driven by clock n0' or 'which DFFs are clocked by clk?'. Do not use "
+                "get_reachable_gates_from_net for clock-pin queries. Large results are "
+                "written under ./_tmp/ and returned as file_path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "clock_signal": {
+                        "type": "string",
+                        "description": "Clock net name to match against each DFF CK pin.",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum number of DFF records to return inline before writing the full list to a file.",
+                    },
+                },
+                "required": ["clock_signal"],
             },
         },
     },
@@ -805,9 +903,13 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Find combinational gate instances by structural filters: gate type, input count, "
                 "and/or exact input signal. Use this before generic replacements for prompts like "
-                "'all 2-input NAND gates that have one input tied to constant 1'. For constant 1, "
+                "'all 2-input NAND gates that have one input tied to constant 1'. Also use this "
+                "for listing gates of a type with their input and output signals, such as 'List "
+                "all NAND gates in this design with their input and output signals'. For constant 1, "
                 "pass has_input=\"1'b1\"; for constant 0, pass has_input=\"1'b0\". The result includes "
                 "the matching instances, their inputs, matched input indices, and other_inputs. "
+                "If the result contains file_path, the complete list has been written there and "
+                "the final answer must report that exact path. "
                 "For later prompts that say 'reported gates' or 'reported NAND gates', use the "
                 "most recent relevant find_gates result from context; if it reported zero matches, "
                 "do not transform anything."
@@ -917,6 +1019,57 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_binary_gate_equivalent_pair",
+            "description": (
+                "Find whether there exists a pair of existing netlist signals (a,b) such "
+                "that a virtual 2-input primitive gate gate_type(a,b) is functionally "
+                "equivalent to target_signal. Use this exact tool for prompts like "
+                "'does there exist internal signals a,b such that NAND(a,b) equals n25?' "
+                "Candidates may be outputs of any gate type; do not use find_gates for "
+                "this existential expression query."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_signal": {
+                        "type": "string",
+                        "description": "Target signal whose function should equal gate_type(a,b).",
+                    },
+                    "gate_type": {
+                        "type": "string",
+                        "enum": ["and", "or", "nand", "nor", "xor", "xnor"],
+                        "description": "The virtual binary gate to apply to candidate signals.",
+                    },
+                    "candidate_scope": {
+                        "type": "string",
+                        "enum": ["internal", "all"],
+                        "description": (
+                            "Use 'internal' to exclude primary input/output ports; use 'all' "
+                            "only if the prompt explicitly permits primary IO candidates."
+                        ),
+                    },
+                    "max_signature_pairs": {
+                        "type": "integer",
+                        "description": (
+                            "Optional safety budget for broad signature pair search. The "
+                            "tool reports search_complete=false if this budget is reached."
+                        ),
+                    },
+                    "max_formal_checks": {
+                        "type": "integer",
+                        "description": (
+                            "Optional safety budget for expensive Yosys SAT confirmations "
+                            "after signature filtering. Defaults to a small safe value."
+                        ),
+                    },
+                },
+                "required": ["target_signal", "gate_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "check_design_equivalence",
             "description": (
                 "Prove that the CURRENT TRANSFORMED DESIGN is equivalent to the ORIGINAL NETLIST "
@@ -998,7 +1151,9 @@ TOOLS: List[Dict[str, Any]] = [
                 "with explicit new_inputs for those cases. "
                 "This is a broad technology-remapping tool, not a local simplification tool. "
                 "Set output_signal to null to apply across the entire design. "
-                "Returns success, replaced (count), skipped (count)."
+                "Returns success, replaced (count), skipped (count), replacement_gate_types, "
+                "delta_by_type, and gate_counts_after so follow-up gate-count questions can "
+                "use updated counts."
             ),
             "parameters": {
                 "type": "object",
@@ -1084,8 +1239,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "This is only for a specific driven signal, never an entire module or whole design. "
                 "Uses Yosys+ABC with a restricted Liberty library so the result is guaranteed to use "
                 "only the allowed gates. Handles any source gate type (OR, NOR, XOR, etc.) automatically. "
-                "Use this when asked to replace gates in a cone with a restricted set "
-                "(e.g. 'replace all gates in cone of n11[0] with only NAND and NOT gates'). "
+                "Use this only when asked to remap, restrict, rebuild, or convert the entire cone "
+                "to a restricted set (e.g. 'replace all gates in cone of n11[0] with only NAND and NOT gates'). "
+                "Do not use this when the prompt names one source gate type such as 'replace all OR gates'; "
+                "use replace_gate_type_in_cone for that narrower operation. "
                 "Returns success, gates_before, gates_after."
             ),
             "parameters": {
@@ -1116,7 +1273,9 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Count primary inputs and primary outputs in the current design. Use this "
                 "exact tool for prompts such as 'Determine the number of primary inputs "
-                "and outputs.' Returns declared port counts and bit-expanded counts."
+                "and outputs.' Returns declared port counts and bit-expanded counts. "
+                "Do not use this when the prompt asks to list port names with bit widths; "
+                "use list_primary_ios instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1128,12 +1287,117 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_primary_ios",
+            "description": (
+                "List primary input and primary output ports with declared bit widths, "
+                "Verilog ranges, and expanded bit names. Use this exact tool for prompts "
+                "such as 'Please list all the primary inputs of this design with their bit "
+                "widths', 'list all primary outputs with widths', or 'show all primary I/O "
+                "ports and their bit widths'. Do not use list_signals for primary port "
+                "width questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimize_depth_preserving_cone_gate_set",
+            "description": (
+                "Optimize/minimize the WHOLE DESIGN maximum logic depth while preserving a "
+                "gate-set restriction on only one named fanin cone. Use this exact tool for "
+                "prompts like 'minimize maximum path depth, ensuring the cone of n15 contains "
+                "only AND, OR, and NOT gates' or 'optimize depth while the cone of n11[0] "
+                "continues to use only NAND and NOT gates' when the cost function is the "
+                "maximum logic depth of the final design. Internally this first runs "
+                "unrestricted whole-design depth optimization, then remaps only the requested "
+                "cone to allowed_gates. Do not use reduce_critical_path(allowed_gates=...) "
+                "for cone-only restrictions, because that restricts the entire design. "
+                "Do not use this when the cost function is the depth of the named cone itself; "
+                "use optimize_cone_depth_preserving_gate_set instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string",
+                        "description": "The output/net whose fanin cone must obey allowed_gates.",
+                    },
+                    "allowed_gates": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Only these combinational gate types may remain in the named cone. "
+                            "Valid values: 'and', 'nand', 'nor', 'or', 'not', 'xor', 'xnor', 'buf'."
+                        ),
+                    },
+                    "verify_equivalence": {
+                        "type": "boolean",
+                        "description": (
+                            "Optional expensive equivalence check against the originally loaded design. "
+                            "Set true when the prompt explicitly asks to ensure functional equivalence."
+                        ),
+                    },
+                },
+                "required": ["output_signal", "allowed_gates"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimize_cone_depth_preserving_gate_set",
+            "description": (
+                "Optimize/minimize the depth of one named fanin cone while preserving a "
+                "gate-set restriction on that same cone. Use this exact tool for prompts like "
+                "'Optimize the depth of the cone of n8 while ensuring the cone of n8 maintains "
+                "only NAND and NOT gates' or prompts where the cost function is explicitly "
+                "'the depth of the cone'. This does not optimize the whole design first; it "
+                "extracts/remaps only the named cone and restores the input design if the cone "
+                "depth does not improve. Do not use optimize_depth_preserving_cone_gate_set "
+                "for cone-depth cost prompts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string",
+                        "description": "The output/net whose fanin cone depth should be optimized.",
+                    },
+                    "allowed_gates": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Only these combinational gate types may remain in the named cone. "
+                            "Valid values: 'and', 'nand', 'nor', 'or', 'not', 'xor', 'xnor', 'buf'."
+                        ),
+                    },
+                    "verify_equivalence": {
+                        "type": "boolean",
+                        "description": (
+                            "Optional. The tool uses functional-preserving synthesis/remapping; "
+                            "full-design equivalence is intentionally not run for this cone-local flow."
+                        ),
+                    },
+                },
+                "required": ["output_signal", "allowed_gates"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_signals",
             "description": (
                 "Return a compact signal inventory for the currently loaded netlist. "
                 "Large lists are written to ./_tmp/ and only counts, samples, and file paths "
                 "are returned inline. Do not use this for simple primary input/output counts; "
-                "use count_primary_ios instead."
+                "use count_primary_ios instead. Do not use this for listing primary input "
+                "or output bit widths; use list_primary_ios instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1149,8 +1413,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "Invoke this without fail when asked to reduce, minimize or optimize the critical path depth "
                 "or maximum logic depth of the design. "
                 "Uses Yosys+ABC logic restructuring to reduce combinational depth. "
-                "When the request says the netlist must remain restricted to specific gate types, "
+                "When the request says the ENTIRE netlist/design must remain restricted to specific gate types, "
                 "pass those exact types in allowed_gates (for example ['and', 'not']). "
+                "If only a named cone has a gate-set restriction, use "
+                "optimize_depth_preserving_cone_gate_set instead. "
                 "If omitted, a restriction established by remap_design_with_gates is inherited. "
                 "No retiming or sequential changes are made — only combinational logic is restructured. "
                 "Returns depth_before, depth_after, improvement and success."
@@ -1163,7 +1429,7 @@ TOOLS: List[Dict[str, Any]] = [
                         "items": {"type": "string"},
                         "description": (
                             "Optional exclusive gate set for the optimized result. "
-                            "Use whenever the prompt says the design must remain those gates only."
+                            "Use only when the prompt says the entire design must remain those gates only."
                         ),
                     },
                 },
