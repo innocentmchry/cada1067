@@ -174,6 +174,7 @@ class EDAEngine:
         self._instance_counter: int = 0
         self._allowed_gates_constraint: Optional[List[str]] = None
         self._original_netlist_path: Optional[str] = None
+        self._last_constant_input_report: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Netlist lifecycle
@@ -1751,9 +1752,6 @@ class EDAEngine:
             "clock_signal": clock_signal,
             "count": len(matches),
         }
-        if len(matches) <= inline_limit:
-            result["flip_flops"] = matches
-            return result
 
         report = tempfile.NamedTemporaryFile(
             "w",
@@ -1777,7 +1775,6 @@ class EDAEngine:
             report.write("# jsonl:\n")
             for item in matches:
                 report.write(json.dumps(item, sort_keys=True) + "\n")
-        result["sample_flip_flops"] = matches[:inline_limit]
         result["file_path"] = os.path.abspath(report.name)
         return result
 
@@ -2600,7 +2597,7 @@ sat -prove {prove_signal} {prove_value} -verify
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def check_design_equivalence(self) -> dict:
-        """Prove the current netlist equivalent to the originally loaded design."""
+        """Prove current-vs-original equivalence at combinational DFF boundaries."""
         import shutil
         import textwrap
 
@@ -2613,12 +2610,51 @@ sat -prove {prove_signal} {prove_value} -verify
         if not os.path.exists(original_path):
             raise FileNotFoundError(f"Original netlist not found: {original_path!r}")
 
-        original_top = parse_verilog(original_path).module_name
+        original_nl = parse_verilog(original_path)
+        dff_mismatch = self._compare_dff_boundary_shapes(original_nl, nl)
+        if dff_mismatch:
+            log_file = tempfile.NamedTemporaryFile(
+                "w",
+                prefix="design_equiv_",
+                suffix=".log",
+                dir=_workspace_temp_dir(),
+                delete=False,
+            )
+            with log_file:
+                log_file.write(dff_mismatch + "\n")
+            return {
+                "equivalent": False,
+                "status": "FAIL",
+                "mode": "comb_dff_boundary",
+                "reason": dff_mismatch,
+                "original_netlist": original_path,
+                "log_path": log_file.name,
+            }
+        if self._netlists_structurally_equal(original_nl, nl):
+            log_file = tempfile.NamedTemporaryFile(
+                "w",
+                prefix="design_equiv_",
+                suffix=".log",
+                dir=_workspace_temp_dir(),
+                delete=False,
+            )
+            with log_file:
+                log_file.write(
+                    "PASS: current design is equivalent to the original netlist "
+                    "under combinational DFF-boundary equivalence.\n"
+                )
+            return {
+                "equivalent": True,
+                "status": "PASS",
+                "original_netlist": original_path,
+                "log_path": log_file.name,
+            }
+
         tmp_dir = tempfile.mkdtemp(
             prefix="design_equiv_", dir=_workspace_temp_dir()
         )
-        current_path = os.path.join(tmp_dir, "current.v")
-        dff_path = os.path.join(tmp_dir, "dff.v")
+        gold_path = os.path.join(tmp_dir, "gold_comb.v")
+        gate_path = os.path.join(tmp_dir, "gate_comb.v")
         script_path = os.path.join(tmp_dir, "equiv.ys")
         log_file = tempfile.NamedTemporaryFile(
             "w",
@@ -2630,37 +2666,26 @@ sat -prove {prove_signal} {prove_value} -verify
         log_path = log_file.name
         log_file.close()
 
-        write_verilog(nl, current_path)
-        with open(dff_path, "w") as fh:
-            fh.write(textwrap.dedent("""\
-                module dff (CK, RN, SN, D, Q);
-                  input CK, RN, SN, D;
-                  output reg Q;
-                  always @(posedge CK or negedge RN or negedge SN) begin
-                    if (!RN) Q <= 1'b0;
-                    else if (!SN) Q <= 1'b1;
-                    else Q <= D;
-                  end
-                endmodule
-            """))
+        gold_comb = self._make_dff_boundary_comb_netlist(original_nl, "gold_comb")
+        gate_comb = self._make_dff_boundary_comb_netlist(nl, "gate_comb")
+        write_verilog(gold_comb, gold_path)
+        write_verilog(gate_comb, gate_path)
 
         script = textwrap.dedent(f"""\
-            read_verilog -sv {dff_path} {original_path}
-            hierarchy -top {original_top}
+            read_verilog -sv {gold_path}
+            hierarchy -top gold_comb
             proc
-            async2sync
             flatten
             opt_clean
-            rename {original_top} gold
+            rename gold_comb gold
             design -stash gold
 
-            read_verilog -sv {dff_path} {current_path}
-            hierarchy -top {nl.module_name}
+            read_verilog -sv {gate_path}
+            hierarchy -top gate_comb
             proc
-            async2sync
             flatten
             opt_clean
-            rename {nl.module_name} gate
+            rename gate_comb gate
             design -stash gate
 
             design -copy-from gold -as gold gold
@@ -2668,8 +2693,8 @@ sat -prove {prove_signal} {prove_value} -verify
             equiv_make gold gate equiv
             hierarchy -top equiv
             clean -purge
+            equiv_struct
             equiv_simple
-            equiv_induct -seq 12
             equiv_status -assert
         """)
         with open(script_path, "w") as fh:
@@ -2688,7 +2713,7 @@ sat -prove {prove_signal} {prove_value} -verify
             except subprocess.TimeoutExpired as exc:
                 with open(log_path, "w") as fh:
                     fh.write(script)
-                    fh.write("\n\nYosys equivalence timed out after 300 seconds.\n")
+                    fh.write("\n\nYosys combinational boundary equivalence timed out after 300 seconds.\n")
                     if exc.stdout:
                         fh.write(str(exc.stdout))
                     if exc.stderr:
@@ -2696,6 +2721,7 @@ sat -prove {prove_signal} {prove_value} -verify
                 return {
                     "equivalent": False,
                     "status": "TIMEOUT",
+                    "mode": "comb_dff_boundary",
                     "original_netlist": original_path,
                     "log_path": log_path,
                 }
@@ -2714,11 +2740,151 @@ sat -prove {prove_signal} {prove_value} -verify
             return {
                 "equivalent": equivalent,
                 "status": status,
+                "mode": "comb_dff_boundary",
                 "original_netlist": original_path,
                 "log_path": log_path,
             }
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _compare_dff_boundary_shapes(self, gold: Netlist, gate: Netlist) -> Optional[str]:
+        """Return a mismatch reason if DFF-boundary equivalence cannot be set up."""
+        if set(gold.primary_inputs) != set(gate.primary_inputs):
+            return (
+                "Primary input sets differ between original and current netlists: "
+                f"original={sorted(gold.primary_inputs)}, current={sorted(gate.primary_inputs)}"
+            )
+        if set(gold.primary_outputs) != set(gate.primary_outputs):
+            return (
+                "Primary output sets differ between original and current netlists: "
+                f"original={sorted(gold.primary_outputs)}, current={sorted(gate.primary_outputs)}"
+            )
+        if set(gold.dffs) != set(gate.dffs):
+            return (
+                "DFF instance sets differ between original and current netlists: "
+                f"original_only={sorted(set(gold.dffs) - set(gate.dffs))}, "
+                f"current_only={sorted(set(gate.dffs) - set(gold.dffs))}"
+            )
+        return None
+
+    def _netlists_structurally_equal(self, a: Netlist, b: Netlist) -> bool:
+        """Conservative structural identity check before invoking formal tools."""
+        def payload(nl: Netlist) -> dict:
+            return {
+                "primary_inputs": list(nl.primary_inputs),
+                "primary_outputs": list(nl.primary_outputs),
+                "wires": {
+                    name: {
+                        "width": wi.width,
+                        "is_bus": wi.is_bus,
+                        "msb": wi.msb,
+                        "lsb": wi.lsb,
+                    }
+                    for name, wi in sorted(nl.wires.items())
+                },
+                "nodes": {
+                    name: {
+                        "gate_type": node.gate_type,
+                        "inputs": list(node.inputs),
+                        "output": node.output,
+                    }
+                    for name, node in sorted(nl.nodes.items())
+                },
+                "dffs": {
+                    name: {
+                        "ck": dff.ck,
+                        "rn": dff.rn,
+                        "sn": dff.sn,
+                        "d": dff.d,
+                        "q": dff.q,
+                    }
+                    for name, dff in sorted(nl.dffs.items())
+                },
+            }
+
+        return payload(a) == payload(b)
+
+    def _make_dff_boundary_comb_netlist(self, source: Netlist, module_name: str) -> Netlist:
+        """Create a combinational view with DFF Qs as inputs and DFF pins as outputs."""
+        comb = copy.deepcopy(source)
+        comb.module_name = module_name
+        comb.dffs = {}
+
+        existing_names = set(comb.wires) | set(comb.nodes) | set(comb.primary_inputs) | set(comb.primary_outputs)
+
+        def unique_name(base: str) -> str:
+            name = base
+            suffix = 0
+            while name in existing_names:
+                suffix += 1
+                name = f"{base}_{suffix}"
+            existing_names.add(name)
+            return name
+
+        for inst_name, dff in source.dffs.items():
+            state_input = unique_name(f"_equiv_state_{inst_name}")
+            comb.primary_inputs.append(state_input)
+            comb.wires[state_input] = WireInfo(name=state_input)
+            buf_name = unique_name(f"_equiv_statebuf_{inst_name}")
+            comb.nodes[buf_name] = GateNode(
+                name=buf_name,
+                gate_type="buf",
+                inputs=[state_input],
+                output=dff.q,
+            )
+
+        for inst_name, dff in source.dffs.items():
+            for pin_name, signal in (
+                ("d", dff.d),
+                ("ck", dff.ck),
+                ("rn", dff.rn),
+                ("sn", dff.sn or "1'b1"),
+            ):
+                out_name = unique_name(f"_equiv_{pin_name}_{inst_name}")
+                comb.primary_outputs.append(out_name)
+                comb.wires[out_name] = WireInfo(name=out_name)
+                buf_name = unique_name(f"_equiv_{pin_name}buf_{inst_name}")
+                comb.nodes[buf_name] = GateNode(
+                    name=buf_name,
+                    gate_type="buf",
+                    inputs=[signal],
+                    output=out_name,
+                )
+
+        return comb
+
+    # Legacy sequential whole-design equivalence flow kept for reference.
+    # It is intentionally not the default because the competition checks
+    # combinational behavior with DFF Q pins treated as unconstrained inputs.
+    #
+    # def check_design_equivalence_sequential_legacy(self) -> dict:
+    #     ...
+    #     read_verilog -sv dff.v original.v
+    #     hierarchy -top <original_top>
+    #     proc
+    #     async2sync
+    #     flatten
+    #     opt_clean
+    #     rename <original_top> gold
+    #     design -stash gold
+    #
+    #     read_verilog -sv dff.v current.v
+    #     hierarchy -top <current_top>
+    #     proc
+    #     async2sync
+    #     flatten
+    #     opt_clean
+    #     rename <current_top> gate
+    #     design -stash gate
+    #
+    #     design -copy-from gold -as gold gold
+    #     design -copy-from gate -as gate gate
+    #     equiv_make gold gate equiv
+    #     hierarchy -top equiv
+    #     clean -purge
+    #     equiv_simple
+    #     equiv_induct -seq 12
+    #     equiv_status -assert
 
     def find_instances_by_name_pattern(
         self, gate_type: str, name_pattern: str
@@ -2844,6 +3010,648 @@ sat -prove {prove_signal} {prove_value} -verify
         result["sample_matches"] = matches[:inline_limit]
         result["file_path"] = os.path.abspath(report.name)
         return result
+
+    def find_gates_with_constant_inputs(
+        self,
+        gate_type: str,
+        values: Optional[List[object]] = None,
+        functional: bool = True,
+        inline_limit: int = 50,
+    ) -> dict:
+        """Report gates whose inputs are literal or functionally constant."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        gate_type = gate_type.strip().lower()
+        if gate_type not in PRIMITIVE_GATES:
+            raise ValueError(f"Unknown gate type: {gate_type!r}")
+
+        wanted_values = self._normalize_constant_values(values or [0, 1])
+        candidate_gates = [
+            (inst_name, node)
+            for inst_name, node in nl.nodes.items()
+            if node.gate_type == gate_type
+        ]
+        candidate_signals = sorted(
+            {
+                signal
+                for _, node in candidate_gates
+                for signal in node.inputs
+            }
+        )
+
+        propagated_constants = self._constant_propagation_facts()
+        simulated_observations = self._simulate_signal_observations(
+            candidate_signals, rounds=512
+        )
+        signal_results: Dict[str, dict] = {}
+        pending_formal: Dict[str, int] = {}
+
+        for signal in candidate_signals:
+            classification = self._classify_constant_candidate(
+                signal,
+                wanted_values,
+                propagated_constants,
+                simulated_observations.get(signal, set()),
+                functional,
+            )
+            if classification.get("status") == "pending_formal":
+                pending_formal[signal] = int(classification["observed_value"])
+            signal_results[signal] = classification
+
+        if pending_formal:
+            formal_results = self._batch_prove_observed_constants(pending_formal)
+            for signal, classification in formal_results.items():
+                signal_results[signal] = classification
+
+        complete = not any(
+            result.get("status") in {"unknown", "pending_formal"}
+            for result in signal_results.values()
+        )
+
+        matches: List[dict] = []
+        for inst_name, node in candidate_gates:
+            constant_inputs = []
+            for index, signal in enumerate(node.inputs):
+                classification = signal_results.get(signal, {"constant": False})
+                if not classification.get("constant"):
+                    continue
+                value = int(classification["value"])
+                if value not in wanted_values:
+                    continue
+                constant_inputs.append(
+                    {
+                        "index": index,
+                        "signal": signal,
+                        "value": value,
+                        "proof": classification.get("proof", "unknown"),
+                    }
+                )
+
+            if not constant_inputs:
+                continue
+            matches.append(
+                {
+                    "instance": inst_name,
+                    "gate_type": node.gate_type,
+                    "output": node.output,
+                    "inputs": list(node.inputs),
+                    "constant_inputs": constant_inputs,
+                }
+            )
+
+        unknown_signals = [
+            signal
+            for signal, result in signal_results.items()
+            if result.get("status") == "unknown"
+        ]
+        result = {
+            "count": len(matches),
+            "gate_type": gate_type,
+            "values": sorted(wanted_values),
+            "functional": bool(functional),
+            "complete": complete,
+            "candidate_gates": len(candidate_gates),
+            "candidate_signals": len(candidate_signals),
+            "unknown_signals": unknown_signals[:20],
+            "unknown_signal_count": len(unknown_signals),
+        }
+
+        if len(matches) <= inline_limit:
+            result["matches"] = matches
+            self._last_constant_input_report = copy.deepcopy(result)
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="constant_input_gates_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(
+                f"# find_gates_with_constant_inputs gate_type={gate_type} "
+                f"values={sorted(wanted_values)} count={len(matches)} "
+                f"complete={complete}\n"
+            )
+            report.write("# columns: instance gate_type output inputs constant_inputs\n")
+            for item in matches:
+                report.write(
+                    "# "
+                    f"{item['instance']} {item['gate_type']} {item['output']} "
+                    f"{','.join(item['inputs'])} "
+                    f"{json.dumps(item['constant_inputs'], sort_keys=True)}\n"
+                )
+            report.write("# jsonl:\n")
+            for item in matches:
+                report.write(json.dumps(item, sort_keys=True) + "\n")
+
+        result["sample_matches"] = matches[:inline_limit]
+        result["file_path"] = os.path.abspath(report.name)
+        self._last_constant_input_report = copy.deepcopy(result)
+        return result
+
+    def _normalize_constant_values(self, values: List[object]) -> Set[int]:
+        normalized: Set[int] = set()
+        for value in values:
+            raw = str(value).strip().lower().replace("_", "")
+            if raw in {"0", "'0", "1'b0"}:
+                normalized.add(0)
+            elif raw in {"1", "'1", "1'b1"}:
+                normalized.add(1)
+            else:
+                try:
+                    parsed = int(raw, 0)
+                except ValueError as exc:
+                    raise ValueError(f"Unsupported constant value {value!r}.") from exc
+                if parsed not in {0, 1}:
+                    raise ValueError("Only scalar constant values 0 and 1 are supported.")
+                normalized.add(parsed)
+        return normalized
+
+    def _literal_constant_value(self, signal: str) -> Optional[int]:
+        key = signal.strip().lower().replace("_", "")
+        if key in {"0", "'0", "1'b0"}:
+            return 0
+        if key in {"1", "'1", "1'b1"}:
+            return 1
+        return None
+
+    def _is_unconstrained_boundary_signal(self, signal: str) -> bool:
+        nl = self._netlist
+        assert nl is not None
+        if signal in nl.primary_inputs:
+            return True
+        bit_select = re.fullmatch(r"([A-Za-z_$][\w$]*)\[\d+\]", signal)
+        if bit_select and bit_select.group(1) in nl.primary_inputs:
+            return True
+        return signal in {dff.q for dff in nl.dffs.values() if dff.q}
+
+    def _constant_propagation_facts(self) -> Dict[str, int]:
+        """Conservative constants proven by local gate-level propagation."""
+        nl = self._netlist
+        assert nl is not None
+        constants: Dict[str, int] = {"1'b0": 0, "1'b1": 1, "0": 0, "1": 1, "'0": 0, "'1": 1}
+
+        def val(signal: str) -> Optional[int]:
+            literal = self._literal_constant_value(signal)
+            if literal is not None:
+                return literal
+            return constants.get(signal)
+
+        changed = True
+        while changed:
+            changed = False
+            for node in nl.nodes.values():
+                if node.output in constants:
+                    continue
+                input_values = [val(signal) for signal in node.inputs]
+                result: Optional[int] = None
+                if node.gate_type == "buf" and input_values[0] is not None:
+                    result = input_values[0]
+                elif node.gate_type == "not" and input_values[0] is not None:
+                    result = 1 - input_values[0]
+                elif node.gate_type == "and":
+                    if 0 in input_values:
+                        result = 0
+                    elif all(value == 1 for value in input_values):
+                        result = 1
+                elif node.gate_type == "nand":
+                    if 0 in input_values:
+                        result = 1
+                    elif all(value == 1 for value in input_values):
+                        result = 0
+                elif node.gate_type == "or":
+                    if 1 in input_values:
+                        result = 1
+                    elif all(value == 0 for value in input_values):
+                        result = 0
+                elif node.gate_type == "nor":
+                    if 1 in input_values:
+                        result = 0
+                    elif all(value == 0 for value in input_values):
+                        result = 1
+                elif node.gate_type in {"xor", "xnor"} and all(
+                    value is not None for value in input_values
+                ):
+                    ones = sum(int(value) for value in input_values)
+                    result = ones % 2
+                    if node.gate_type == "xnor":
+                        result = 1 - result
+
+                if result is not None:
+                    constants[node.output] = result
+                    changed = True
+        return constants
+
+    def _simulate_signal_observations(
+        self, signals: List[str], rounds: int = 96
+    ) -> Dict[str, Set[int]]:
+        """Random-simulate candidate signals to discard obvious non-constants."""
+        nl = self._netlist
+        assert nl is not None
+        rng = random.Random(0)
+        observations: Dict[str, Set[int]] = {signal: set() for signal in signals}
+        output_to_gate = {node.output: node for node in nl.nodes.values()}
+        dff_qs = {dff.q for dff in nl.dffs.values() if dff.q}
+
+        def gate_eval(gate_type: str, inputs: List[int]) -> int:
+            if gate_type == "buf":
+                return inputs[0]
+            if gate_type == "not":
+                return 1 - inputs[0]
+            if gate_type == "and":
+                return int(all(inputs))
+            if gate_type == "nand":
+                return 1 - int(all(inputs))
+            if gate_type == "or":
+                return int(any(inputs))
+            if gate_type == "nor":
+                return 1 - int(any(inputs))
+            if gate_type == "xor":
+                return sum(inputs) % 2
+            if gate_type == "xnor":
+                return 1 - (sum(inputs) % 2)
+            raise ValueError(f"Unsupported gate type for simulation: {gate_type!r}")
+
+        for _ in range(rounds):
+            memo: Dict[str, int] = {
+                "1'b0": 0,
+                "0": 0,
+                "'0": 0,
+                "1'b1": 1,
+                "1": 1,
+                "'1": 1,
+            }
+            for pi in nl.primary_inputs:
+                wi = nl.wires.get(pi)
+                if wi and wi.is_bus:
+                    for bit in range(min(wi.msb, wi.lsb), max(wi.msb, wi.lsb) + 1):
+                        memo[f"{pi}[{bit}]"] = rng.randint(0, 1)
+                memo[pi] = rng.randint(0, 1)
+            for q in dff_qs:
+                memo[q] = rng.randint(0, 1)
+
+            visiting: Set[str] = set()
+
+            def value(signal: str) -> int:
+                literal = self._literal_constant_value(signal)
+                if literal is not None:
+                    return literal
+                if signal in memo:
+                    return memo[signal]
+                if signal in visiting:
+                    memo[signal] = rng.randint(0, 1)
+                    return memo[signal]
+                node = output_to_gate.get(signal)
+                if node is None:
+                    memo[signal] = rng.randint(0, 1)
+                    return memo[signal]
+                visiting.add(signal)
+                input_values = [value(inp) for inp in node.inputs]
+                visiting.remove(signal)
+                memo[signal] = gate_eval(node.gate_type, input_values)
+                return memo[signal]
+
+            for signal in signals:
+                observations[signal].add(value(signal))
+        return observations
+
+    def _classify_constant_candidate(
+        self,
+        signal: str,
+        wanted_values: Set[int],
+        propagated_constants: Dict[str, int],
+        simulated_observations: Set[int],
+        functional: bool,
+    ) -> dict:
+        literal = self._literal_constant_value(signal)
+        if literal is not None:
+            return {
+                "constant": literal in wanted_values,
+                "value": literal,
+                "proof": "literal",
+                "status": "complete",
+            }
+        if self._is_unconstrained_boundary_signal(signal):
+            return {
+                "constant": False,
+                "proof": "boundary_input",
+                "status": "complete",
+            }
+        if signal in propagated_constants:
+            value = propagated_constants[signal]
+            return {
+                "constant": value in wanted_values,
+                "value": value,
+                "proof": "propagation",
+                "status": "complete",
+            }
+        if len(simulated_observations) > 1:
+            return {"constant": False, "proof": "simulation_filter", "status": "complete"}
+        if simulated_observations:
+            observed = next(iter(simulated_observations))
+            if observed not in wanted_values:
+                return {
+                    "constant": False,
+                    "proof": "simulation_filter",
+                    "status": "complete",
+                }
+        if not functional:
+            return {"constant": False, "proof": "structural_only", "status": "complete"}
+        if simulated_observations:
+            observed = next(iter(simulated_observations))
+            return {
+                "constant": False,
+                "proof": "formal",
+                "status": "pending_formal",
+                "observed_value": observed,
+            }
+        return {
+            "constant": False,
+            "proof": "formal",
+            "status": "unknown",
+            "reason": "No simulation observation available for formal target selection.",
+        }
+
+    def _batch_prove_observed_constants(
+        self, observed_values: Dict[str, int]
+    ) -> Dict[str, dict]:
+        """Classify possible constants by searching for batch counterexamples."""
+        remaining = dict(observed_values)
+        results: Dict[str, dict] = {}
+        chunk_size = 50
+
+        while remaining:
+            progress = False
+            chunks = [
+                dict(list(remaining.items())[index : index + chunk_size])
+                for index in range(0, len(remaining), chunk_size)
+            ]
+            for chunk in chunks:
+                active_chunk = {
+                    signal: value
+                    for signal, value in chunk.items()
+                    if signal in remaining
+                }
+                if not active_chunk:
+                    continue
+
+                model = self._find_constant_counterexample_model(active_chunk)
+                if model is None:
+                    for signal, value in active_chunk.items():
+                        results[signal] = {
+                            "constant": True,
+                            "value": value,
+                            "proof": "formal",
+                            "status": "complete",
+                        }
+                        remaining.pop(signal, None)
+                    progress = True
+                    continue
+
+                if not model:
+                    for signal in active_chunk:
+                        results[signal] = {
+                            "constant": False,
+                            "proof": "formal",
+                            "status": "unknown",
+                            "reason": "SAT counterexample did not include probe values.",
+                        }
+                        remaining.pop(signal, None)
+                    progress = True
+                    continue
+
+                for signal in model:
+                    if signal not in remaining:
+                        continue
+                    results[signal] = {
+                        "constant": False,
+                        "proof": "formal",
+                        "status": "complete",
+                    }
+                    remaining.pop(signal, None)
+                    progress = True
+
+            if not progress:
+                for signal in list(remaining):
+                    results[signal] = {
+                        "constant": False,
+                        "proof": "formal",
+                        "status": "unknown",
+                        "reason": "Batch SAT made no classification progress.",
+                    }
+                    remaining.pop(signal, None)
+                break
+
+        return results
+
+    def _find_constant_counterexample_model(
+        self, observed_values: Dict[str, int]
+    ) -> Optional[Dict[str, int]]:
+        """Return one model where any signal differs from its observed value.
+
+        Returns None when no counterexample exists.
+        """
+        import shutil
+        import textwrap
+
+        nl = self._netlist
+        assert nl is not None
+        comb_nl = copy.deepcopy(nl)
+        q_aliases: Dict[str, str] = {}
+        for index, dff in enumerate(comb_nl.dffs.values()):
+            if not dff.q or dff.q in q_aliases:
+                continue
+            alias = f"_constant_batch_q_{index}"
+            q_aliases[dff.q] = alias
+            comb_nl.wires[alias] = WireInfo(name=alias)
+            comb_nl.primary_inputs.append(alias)
+        for node in comb_nl.nodes.values():
+            node.inputs = [q_aliases.get(sig, sig) for sig in node.inputs]
+        comb_nl.dffs.clear()
+
+        probe_to_signal: Dict[str, str] = {}
+        diff_signals: List[str] = []
+        existing = set(comb_nl.wires) | set(comb_nl.nodes) | set(comb_nl.primary_outputs)
+
+        def add_wire(base: str) -> str:
+            name = base
+            suffix = 0
+            while name in existing:
+                suffix += 1
+                name = f"{base}_{suffix}"
+            existing.add(name)
+            comb_nl.wires[name] = WireInfo(name=name)
+            return name
+
+        def add_gate(base: str, gate_type: str, inputs: List[str], output: str) -> None:
+            name = base
+            suffix = 0
+            while name in existing:
+                suffix += 1
+                name = f"{base}_{suffix}"
+            existing.add(name)
+            comb_nl.nodes[name] = GateNode(
+                name=name,
+                gate_type=gate_type,
+                inputs=inputs,
+                output=output,
+            )
+
+        for index, (signal, observed) in enumerate(observed_values.items()):
+            probe = add_wire(f"_constant_probe_{index}")
+            comb_nl.primary_outputs.append(probe)
+            probe_to_signal[probe] = signal
+            add_gate(
+                f"_constant_probe_buf_{index}",
+                "buf",
+                [q_aliases.get(signal, signal)],
+                probe,
+            )
+            if observed == 0:
+                diff_signals.append(probe)
+            else:
+                diff = add_wire(f"_constant_diff_{index}")
+                add_gate(f"_constant_diff_not_{index}", "not", [probe], diff)
+                diff_signals.append(diff)
+
+        if not diff_signals:
+            return None
+        current = diff_signals[0]
+        for index, diff in enumerate(diff_signals[1:]):
+            out = add_wire(f"_constant_diff_or_{index}")
+            add_gate(f"_constant_diff_or_gate_{index}", "or", [current, diff], out)
+            current = out
+        diff_any = add_wire("_constant_diff_any")
+        comb_nl.primary_outputs.append(diff_any)
+        add_gate("_constant_diff_any_buf", "buf", [current], diff_any)
+
+        tmp_dir = tempfile.mkdtemp(
+            prefix="constant_batch_", dir=_workspace_temp_dir()
+        )
+        netlist_path = os.path.join(tmp_dir, "netlist.v")
+        script_path = os.path.join(tmp_dir, "prove.ys")
+        write_verilog(comb_nl, netlist_path)
+        show_args = " ".join(f"-show {probe}" for probe in probe_to_signal)
+        script = textwrap.dedent(f"""\
+            read_verilog {netlist_path}
+            prep -top {comb_nl.module_name}
+            sat -set {diff_any} 1 -max 64 {show_args} -show {diff_any}
+        """)
+        with open(script_path, "w") as fh:
+            fh.write(script)
+
+        try:
+            result = subprocess.run(
+                [_yosys_binary(), "-s", script_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
+            )
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            lower = combined.lower()
+            if "sat solving finished - no model found" in lower:
+                return None
+            if "sat solving finished - model found" not in lower:
+                raise RuntimeError(
+                    "Could not determine Yosys SAT batch result:\n" + combined[-3000:]
+                )
+            model: Dict[str, int] = {}
+            for probe, signal in probe_to_signal.items():
+                pattern = re.compile(
+                    rf"\\{re.escape(probe)}\s+\d+\s+[0-9a-fA-F]+\s+([01])\b"
+                )
+                for match in pattern.finditer(combined):
+                    value = int(match.group(1))
+                    if value != observed_values[signal]:
+                        model[signal] = value
+                        break
+            return model
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _prove_scalar_signal_constant(self, signal_name: str, value: int) -> dict:
+        """Prove a scalar signal by buffering it to a generated primary output."""
+        import shutil
+        import textwrap
+
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        if value not in {0, 1}:
+            raise ValueError("Only scalar constants 0 and 1 are supported.")
+
+        comb_nl = copy.deepcopy(nl)
+        q_aliases: Dict[str, str] = {}
+        for index, dff in enumerate(comb_nl.dffs.values()):
+            if not dff.q or dff.q in q_aliases:
+                continue
+            alias = f"_constant_probe_q_{index}"
+            q_aliases[dff.q] = alias
+            comb_nl.wires[alias] = WireInfo(name=alias)
+            comb_nl.primary_inputs.append(alias)
+        for node in comb_nl.nodes.values():
+            node.inputs = [q_aliases.get(sig, sig) for sig in node.inputs]
+        probe_input = q_aliases.get(signal_name, signal_name)
+        comb_nl.dffs.clear()
+
+        probe_output = "_constant_probe_out"
+        probe_inst = "_constant_probe_buf"
+        suffix = 0
+        existing = set(comb_nl.wires) | set(comb_nl.nodes) | set(comb_nl.primary_outputs)
+        while probe_output in existing or probe_inst in existing:
+            suffix += 1
+            probe_output = f"_constant_probe_out_{suffix}"
+            probe_inst = f"_constant_probe_buf_{suffix}"
+        comb_nl.wires[probe_output] = WireInfo(name=probe_output)
+        comb_nl.primary_outputs.append(probe_output)
+        comb_nl.nodes[probe_inst] = GateNode(
+            name=probe_inst,
+            gate_type="buf",
+            inputs=[probe_input],
+            output=probe_output,
+        )
+
+        tmp_dir = tempfile.mkdtemp(
+            prefix="constant_probe_", dir=_workspace_temp_dir()
+        )
+        netlist_path = os.path.join(tmp_dir, "netlist.v")
+        script_path = os.path.join(tmp_dir, "prove.ys")
+        write_verilog(comb_nl, netlist_path)
+        literal = f"1'b{value}"
+        script = textwrap.dedent(f"""\
+            read_verilog {netlist_path}
+            prep -top {comb_nl.module_name}
+            sat -prove {probe_output} {literal} -verify -show-inputs -show {probe_output}
+        """)
+        with open(script_path, "w") as fh:
+            fh.write(script)
+
+        try:
+            result = subprocess.run(
+                [_yosys_binary(), "-s", script_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
+            )
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            if result.returncode == 0:
+                return {"always_equal": True, "signal": signal_name, "value": value}
+            lower = combined.lower()
+            if "proof did fail" in lower or "model found" in lower:
+                return {"always_equal": False, "signal": signal_name, "value": value}
+            raise RuntimeError(
+                "Yosys constant-probe check failed:\n" + combined[-3000:]
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ==================================================================
     # TRANSFORMATION OPERATIONS

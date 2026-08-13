@@ -35,7 +35,7 @@ def _load_config(path: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="cada1067_alpha",
+        prog="cada1067",
         description="LLM-assisted EDA netlist exploration and transformation.",
     )
     parser.add_argument(

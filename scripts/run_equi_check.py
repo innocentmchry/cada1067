@@ -4,9 +4,16 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.netlist_parser import GateNode, Netlist, WireInfo, parse_verilog, write_verilog
 
 
 def workspace_temp_env() -> dict:
@@ -51,35 +58,132 @@ def find_module_name(verilog_path: Path) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def build_yosys_script(gold_file: Path, gate_file: Path, gold_top: str, gate_top: str, dff_lib: Optional[Path] = None) -> str:
-    # If a DFF definition file is given, read it alongside each netlist so any
-    # DFF submodule instances resolve to real logic instead of being treated
-    # as black boxes (which would make their D/Q boundaries unprovable).
-    # `flatten` then inlines that submodule (and any other submodules) into
-    # the top module, so each stashed design is a single flat module -- this
-    # also avoids losing submodule definitions when copying across the
-    # design -stash / -copy-from boundary below.
-    # `async2sync` converts async set/reset FF cells (e.g. $dffsr/$adff) into
-    # an equivalent synchronous representation. Without this, equiv_simple's
-    # SAT engine errors out on any async FF with "No SAT model available".
-    lib_include = f" {dff_lib}" if dff_lib else ""
+def compare_dff_boundary_shapes(gold: Netlist, gate: Netlist) -> Optional[str]:
+    if set(gold.primary_inputs) != set(gate.primary_inputs):
+        return (
+            "Primary input sets differ: "
+            f"gold_only={sorted(set(gold.primary_inputs) - set(gate.primary_inputs))}, "
+            f"gate_only={sorted(set(gate.primary_inputs) - set(gold.primary_inputs))}"
+        )
+    if set(gold.primary_outputs) != set(gate.primary_outputs):
+        return (
+            "Primary output sets differ: "
+            f"gold_only={sorted(set(gold.primary_outputs) - set(gate.primary_outputs))}, "
+            f"gate_only={sorted(set(gate.primary_outputs) - set(gold.primary_outputs))}"
+        )
+    if set(gold.dffs) != set(gate.dffs):
+        return (
+            "DFF instance sets differ: "
+            f"gold_only={sorted(set(gold.dffs) - set(gate.dffs))}, "
+            f"gate_only={sorted(set(gate.dffs) - set(gold.dffs))}"
+        )
+    return None
+
+
+def netlists_structurally_equal(a: Netlist, b: Netlist) -> bool:
+    def payload(nl: Netlist) -> dict:
+        return {
+            "primary_inputs": list(nl.primary_inputs),
+            "primary_outputs": list(nl.primary_outputs),
+            "wires": {
+                name: {
+                    "width": wi.width,
+                    "is_bus": wi.is_bus,
+                    "msb": wi.msb,
+                    "lsb": wi.lsb,
+                }
+                for name, wi in sorted(nl.wires.items())
+            },
+            "nodes": {
+                name: {
+                    "gate_type": node.gate_type,
+                    "inputs": list(node.inputs),
+                    "output": node.output,
+                }
+                for name, node in sorted(nl.nodes.items())
+            },
+            "dffs": {
+                name: {
+                    "ck": dff.ck,
+                    "rn": dff.rn,
+                    "sn": dff.sn,
+                    "d": dff.d,
+                    "q": dff.q,
+                }
+                for name, dff in sorted(nl.dffs.items())
+            },
+        }
+
+    return payload(a) == payload(b)
+
+
+def make_dff_boundary_comb_netlist(source: Netlist, module_name: str) -> Netlist:
+    import copy
+
+    comb = copy.deepcopy(source)
+    comb.module_name = module_name
+    comb.dffs = {}
+
+    existing_names = set(comb.wires) | set(comb.nodes) | set(comb.primary_inputs) | set(comb.primary_outputs)
+
+    def unique_name(base: str) -> str:
+        name = base
+        suffix = 0
+        while name in existing_names:
+            suffix += 1
+            name = f"{base}_{suffix}"
+        existing_names.add(name)
+        return name
+
+    for inst_name, dff in source.dffs.items():
+        state_input = unique_name(f"_equiv_state_{inst_name}")
+        comb.primary_inputs.append(state_input)
+        comb.wires[state_input] = WireInfo(name=state_input)
+        buf_name = unique_name(f"_equiv_statebuf_{inst_name}")
+        comb.nodes[buf_name] = GateNode(
+            name=buf_name,
+            gate_type="buf",
+            inputs=[state_input],
+            output=dff.q,
+        )
+
+    for inst_name, dff in source.dffs.items():
+        for pin_name, signal in (
+            ("d", dff.d),
+            ("ck", dff.ck),
+            ("rn", dff.rn),
+            ("sn", dff.sn or "1'b1"),
+        ):
+            out_name = unique_name(f"_equiv_{pin_name}_{inst_name}")
+            comb.primary_outputs.append(out_name)
+            comb.wires[out_name] = WireInfo(name=out_name)
+            buf_name = unique_name(f"_equiv_{pin_name}buf_{inst_name}")
+            comb.nodes[buf_name] = GateNode(
+                name=buf_name,
+                gate_type="buf",
+                inputs=[signal],
+                output=out_name,
+            )
+
+    return comb
+
+
+def build_yosys_script(gold_file: Path, gate_file: Path) -> str:
     return f"""
-read_verilog -sv{lib_include} {gold_file}
-hierarchy -top {gold_top}
+read_verilog -sv {gold_file}
+hierarchy -top gold_comb
 proc
-async2sync
 flatten
 opt_clean
-rename {gold_top} gold
+rename gold_comb gold
 design -stash gold
 
-read_verilog -sv{lib_include} {gate_file}
-hierarchy -top {gate_top}
+read_verilog -sv {gate_file}
+hierarchy -top gate_comb
 proc
-async2sync
 flatten
 opt_clean
-rename {gate_top} gate
+rename gate_comb gate
 design -stash gate
 
 design -copy-from gold -as gold gold
@@ -88,26 +192,85 @@ design -copy-from gate -as gate gate
 equiv_make gold gate equiv
 hierarchy -top equiv
 clean -purge
+equiv_struct
 equiv_simple
-# Logic rewrites around register boundaries can leave equivalent DFF-Q cells
-# unproven by the purely local/simple pass. Prove those sequential relations
-# inductively before treating them as functional failures.
-equiv_induct -seq 12
 equiv_status -assert
 """
 
 
+# Legacy sequential whole-design equivalence script kept for reference.
+# The competition equivalence model is combinational: DFF Q pins are treated
+# as unconstrained inputs and DFF D/control pins are compared as outputs.
+#
+# def build_yosys_script_sequential_legacy(
+#     gold_file: Path,
+#     gate_file: Path,
+#     gold_top: str,
+#     gate_top: str,
+#     dff_lib: Optional[Path] = None,
+# ) -> str:
+#     lib_include = f" {dff_lib}" if dff_lib else ""
+#     return f"""
+# read_verilog -sv{lib_include} {gold_file}
+# hierarchy -top {gold_top}
+# proc
+# async2sync
+# flatten
+# opt_clean
+# rename {gold_top} gold
+# design -stash gold
+#
+# read_verilog -sv{lib_include} {gate_file}
+# hierarchy -top {gate_top}
+# proc
+# async2sync
+# flatten
+# opt_clean
+# rename {gate_top} gate
+# design -stash gate
+#
+# design -copy-from gold -as gold gold
+# design -copy-from gate -as gate gate
+# equiv_make gold gate equiv
+# hierarchy -top equiv
+# clean -purge
+# equiv_simple
+# equiv_induct -seq 12
+# equiv_status -assert
+# """
+
+
 def run_equiv_check(test_name: str, gold_file: Path, gate_file: Path, log_dir: Path, timeout: int = 1000, dff_lib: Optional[Path] = None) -> EquivResult:
-    gold_top = find_module_name(gold_file)
-    gate_top = find_module_name(gate_file)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{test_name}_equiv.log"
 
-    if gold_top is None or gate_top is None:
-        log_path.write_text(f"Could not detect module name.\ngold_top={gold_top}\ngate_top={gate_top}\n")
-        return EquivResult(test_name, "SKIPPED", "Could not detect module name", log_path)
+    try:
+        gold_nl = parse_verilog(str(gold_file))
+        gate_nl = parse_verilog(str(gate_file))
+    except Exception as exc:
+        log_path.write_text(f"Could not parse netlist(s): {exc}\n")
+        return EquivResult(test_name, "SKIPPED", f"Could not parse netlist(s): {exc}", log_path)
 
-    script = build_yosys_script(gold_file, gate_file, gold_top, gate_top, dff_lib=dff_lib)
+    mismatch = compare_dff_boundary_shapes(gold_nl, gate_nl)
+    if mismatch:
+        log_path.write_text(mismatch + "\n")
+        return EquivResult(test_name, "FAIL", mismatch, log_path)
+    if netlists_structurally_equal(gold_nl, gate_nl):
+        log_path.write_text(
+            "PASS: current design is equivalent to the original netlist "
+            "under combinational DFF-boundary equivalence.\n"
+        )
+        return EquivResult(test_name, "PASS", "Equivalence proven", log_path)
+
+    temp_root = Path(workspace_temp_env()["TMPDIR"])
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"{test_name}_comb_equiv_", dir=temp_root))
+    comb_gold_file = tmp_dir / "gold_comb.v"
+    comb_gate_file = tmp_dir / "gate_comb.v"
+
+    write_verilog(make_dff_boundary_comb_netlist(gold_nl, "gold_comb"), str(comb_gold_file))
+    write_verilog(make_dff_boundary_comb_netlist(gate_nl, "gate_comb"), str(comb_gate_file))
+
+    script = build_yosys_script(comb_gold_file, comb_gate_file)
     temp_env = workspace_temp_env()
 
     try:
@@ -127,6 +290,8 @@ def run_equiv_check(test_name: str, gold_file: Path, gate_file: Path, log_dir: P
         return EquivResult(test_name, "ERROR", f"Timed out after {timeout}s", log_path)
     except FileNotFoundError:
         sys.exit("yosys executable not found. Is Yosys installed and on PATH?")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     output = proc.stdout + "\n" + proc.stderr
     log_path.write_text(f"Yosys script:\n{script}\n\n---- Output ----\n{output}")

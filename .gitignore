@@ -12,3 +12,5 @@ test*
 _tmp*
 docs/
 src/__pycache__/
+config.yaml
+*test*

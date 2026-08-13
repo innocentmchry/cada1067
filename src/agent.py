@@ -60,10 +60,12 @@ _SYSTEM_PROMPT = (
     "the ordered context history, use tools instead of estimating. Tool results may be "
     "compacted to save tokens; when a tool result includes a file_path, always report "
     "that exact file path to the user along with the count instead of saying the full "
-    "list is too long or can be found in the design. For constant "
-    "propagation of gates with tied constant inputs, or prompts referring to reported "
-    "gates, use find_gates results and replace_gate with explicit new_inputs for only "
-    "those instances. If the relevant prior find_gates summary says zero gates were "
+    "list is too long or can be found in the design. For reports of gates with "
+    "constant inputs, use find_gates_with_constant_inputs unless the prompt explicitly "
+    "says the input is tied to a literal constant. For constant propagation of gates "
+    "with tied or reported constant inputs, or prompts referring to reported "
+    "gates, use the prior constant-input report or find_gates results and replace_gate "
+    "with explicit new_inputs for only those instances. If the relevant prior summary says zero gates were "
     "found, report that there is nothing to simplify. Do not use replace_gate_type_in_cone "
     "for constant propagation or reported-gate simplification; it is only for intentional "
     "gate-library remapping of all gates of a type in a scope. For questions asking "
@@ -520,6 +522,28 @@ class EDAAgent:
             if data.get("file_path"):
                 summary += f"; full list in {data['file_path']}"
             return summary
+        elif tool_name == "find_gates_with_constant_inputs":
+            count = data.get("count", 0)
+            gate_type = str(data.get("gate_type", "gate")).upper()
+            values = data.get("values", [0, 1])
+            complete = "complete" if data.get("complete", True) else "incomplete"
+            summary = (
+                f"find_gates_with_constant_inputs: found {count} {gate_type} "
+                f"gate(s) with constant input(s) {values} ({complete})"
+            )
+            matches = data.get("matches") or data.get("sample_matches") or []
+            sample_names = [
+                item.get("instance")
+                for item in matches[:5]
+                if isinstance(item, dict) and item.get("instance")
+            ]
+            if sample_names:
+                summary += f": {', '.join(sample_names)}"
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            if data.get("unknown_signal_count"):
+                summary += f"; {data['unknown_signal_count']} signal(s) unresolved"
+            return summary
         elif tool_name == "find_zero_length_pi_po_paths":
             paths = data.get("paths", [])
             names = [p.get("source") for p in paths[:5] if isinstance(p, dict)]
@@ -671,14 +695,6 @@ class EDAAgent:
                 f"list_flip_flops_by_clock: found {data.get('count', 0)} "
                 f"DFF(s) clocked by {data.get('clock_signal')}"
             )
-            samples = data.get("flip_flops") or data.get("sample_flip_flops") or []
-            sample_names = [
-                item.get("instance")
-                for item in samples[:5]
-                if isinstance(item, dict) and item.get("instance")
-            ]
-            if sample_names:
-                summary += f": {', '.join(sample_names)}"
             if data.get("file_path"):
                 summary += f"; full list in {data['file_path']}"
             return summary
@@ -1101,6 +1117,13 @@ class EDAAgent:
                 args.get("input_count"),
                 args.get("has_input"),
                 args.get("inline_limit", 50),
+            )
+        if tool_name == "find_gates_with_constant_inputs":
+            return eng.find_gates_with_constant_inputs(
+                args["gate_type"],
+                args.get("values", [0, 1]),
+                bool(args.get("functional", True)),
+                int(args.get("inline_limit", 50)),
             )
         if tool_name == "get_net_fanout":
             return eng.get_fanout_report(args["net_name"])

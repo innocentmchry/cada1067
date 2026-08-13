@@ -604,8 +604,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "List all flip-flop/DFF instances whose clock pin is exactly the given "
                 "clock signal. Use this exact tool for prompts like 'List all flip-flops "
                 "driven by clock n0' or 'which DFFs are clocked by clk?'. Do not use "
-                "get_reachable_gates_from_net for clock-pin queries. Large results are "
-                "written under ./_tmp/ and returned as file_path."
+                "get_reachable_gates_from_net for clock-pin queries. Results are "
+                "reported as a total count plus a full-list file_path under ./_tmp/."
             ),
             "parameters": {
                 "type": "object",
@@ -616,7 +616,7 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                     "inline_limit": {
                         "type": "integer",
-                        "description": "Maximum number of DFF records to return inline before writing the full list to a file.",
+                        "description": "Deprecated; DFF records are written to file_path instead of returned inline.",
                     },
                 },
                 "required": ["clock_signal"],
@@ -941,6 +941,44 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_gates_with_constant_inputs",
+            "description": (
+                "Report combinational gates whose inputs are constant 0 or 1 under the "
+                "competition model: primary inputs and DFF-Q outputs are unconstrained, "
+                "and constants are proven on a temporary analysis model without modifying "
+                "the design. Use this exact tool for prompts like 'Report any NAND gates "
+                "with constant inputs (0 or 1)' or 'find gates with functionally constant "
+                "inputs'. Do not use this for wording that specifically says an input is "
+                "'tied to' a literal constant; use find_gates for structural tied constants."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_type": {
+                        "type": "string",
+                        "description": "Gate type filter such as 'nand' or 'and'.",
+                    },
+                    "values": {
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                        "description": "Constant values to report, usually [0, 1].",
+                    },
+                    "functional": {
+                        "type": "boolean",
+                        "description": "When true, prove non-literal signal constants formally.",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum number of matches to return inline before writing the full list to ./_tmp/. Defaults to 50.",
+                    },
+                },
+                "required": ["gate_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_instances_by_name_pattern",
             "description": (
                 "Call this to search for gate instances by gate type and/or instance name pattern. "
@@ -1076,7 +1114,9 @@ TOOLS: List[Dict[str, Any]] = [
                 "loaded by read_design. Invoke this exact non-mutating tool for requests such as "
                 "'prove the transformed design is equivalent to the pre-transformation netlist' "
                 "or 'verify whole-design equivalence'. It serializes the current netlist and runs "
-                "Yosys whole-design sequential equivalence. Never call FRAIG for a proof request."
+                "Yosys combinational equivalence at DFF boundaries, treating DFF Q pins as "
+                "unconstrained inputs and comparing primary outputs plus DFF D/control pins. "
+                "Never call FRAIG for a proof request."
             ),
             "parameters": {
                 "type": "object",
