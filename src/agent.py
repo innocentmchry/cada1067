@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import signal as _signal
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -138,6 +140,22 @@ class EDAAgent:
         self._context_history_limit: int = int(
             safety.get("context_history_limit", 20)
         )
+        self._llm_min_interval: float = float(
+            safety.get("llm_min_interval_seconds", 0.75)
+        )
+        self._rate_limit_max_retries: int = int(
+            safety.get("rate_limit_max_retries", 6)
+        )
+        self._rate_limit_initial_delay: float = float(
+            safety.get("rate_limit_initial_delay_seconds", 1.0)
+        )
+        self._rate_limit_max_delay: float = float(
+            safety.get("rate_limit_max_delay_seconds", 30.0)
+        )
+        self._rate_limit_jitter: float = float(
+            safety.get("rate_limit_jitter_seconds", 0.25)
+        )
+        self._last_llm_call_started: float = 0.0
         self._active_user_message: str = ""
 
     # ------------------------------------------------------------------
@@ -162,7 +180,10 @@ class EDAAgent:
                 "OpenAI API key not configured. "
                 "Set OPENAI_API_KEY in the environment/.env file or set openai.api_key in config.yaml."
             )
-        return OpenAI(api_key=api_key)
+        # Rate-limit retries are handled in _call_llm, where Retry-After and
+        # token-reset headers can be honored. Avoid stacking SDK retries with
+        # the framework's retry loop.
+        return OpenAI(api_key=api_key, max_retries=0)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -330,15 +351,34 @@ class EDAAgent:
             or "cost function is depth of the cone" in prompt
         )
 
-    def _compact_tool_result_for_llm(self, result_str: str) -> str:
+    def _compact_tool_result_for_llm(
+        self, tool_name: str, result_str: str
+    ) -> str:
         """Shrink a tool result before feeding it back to the LLM."""
         try:
             payload = json.loads(result_str)
         except json.JSONDecodeError:
             return self._truncate_text(result_str)
 
-        compacted = self._compact_value(payload)
+        # A singular path is a bounded witness/counterexample, not a collection
+        # of independent results.  Keep it intact so the LLM can report a valid
+        # source-to-sink path, including its destination.  Bulk results use the
+        # plural ``paths`` key and remain subject to normal compaction.
+        witness_path_tools = {
+            "get_max_depth",
+            "get_max_depth_between_endpoint_classes",
+            "find_path_avoiding",
+            "path_passes_through",
+        }
+        preserve_path_keys = tool_name in witness_path_tools
+        compacted = self._compact_value(
+            payload, preserve_path_keys=preserve_path_keys
+        )
         compacted_str = json.dumps(compacted)
+        if preserve_path_keys:
+            # Applying the character-limit fallback here would discard the
+            # beginning of a long path and undo the field-level exemption.
+            return compacted_str
         if len(compacted_str) <= self._max_tool_result_chars:
             return compacted_str
         tail_limit = max(200, self._max_tool_result_chars - 500)
@@ -351,16 +391,48 @@ class EDAAgent:
             }
         )
 
-    def _compact_value(self, value: Any) -> Any:
+    def _compact_value(
+        self,
+        value: Any,
+        *,
+        preserve_path_keys: bool = False,
+        current_key: Optional[str] = None,
+    ) -> Any:
         """Recursively cap large lists and strings in JSON-like data."""
         if isinstance(value, dict):
-            return {k: self._compact_value(v) for k, v in value.items()}
+            return {
+                k: self._compact_value(
+                    v,
+                    preserve_path_keys=preserve_path_keys,
+                    current_key=k,
+                )
+                for k, v in value.items()
+            }
         if isinstance(value, list):
+            if preserve_path_keys and current_key in {
+                "path",
+                "example_path",
+                "counterexample_path",
+            }:
+                return [
+                    self._compact_value(
+                        item, preserve_path_keys=preserve_path_keys
+                    )
+                    for item in value
+                ]
             if len(value) <= self._max_inline_items:
-                return [self._compact_value(v) for v in value]
+                return [
+                    self._compact_value(
+                        item, preserve_path_keys=preserve_path_keys
+                    )
+                    for item in value
+                ]
             return {
                 "inline_items": [
-                    self._compact_value(v) for v in value[: self._max_inline_items]
+                    self._compact_value(
+                        item, preserve_path_keys=preserve_path_keys
+                    )
+                    for item in value[: self._max_inline_items]
                 ],
                 "omitted_items": len(value) - self._max_inline_items,
                 "total_items": len(value),
@@ -506,6 +578,17 @@ class EDAAgent:
                 f"{data.get('output')} = "
                 f"{data.get('depth')}"
             )
+        elif tool_name == "get_logic_cone":
+            count = data.get("count", 0)
+            if data.get("file_path"):
+                return (
+                    f"get_logic_cone: {count} transitive fanin gates; "
+                    f"full list in {data['file_path']}"
+                )
+            return (
+                f"get_logic_cone: {count} transitive fanin gates "
+                f"({', '.join(data.get('gates', []))})"
+            )
         elif tool_name == "count_outputs_by_logic_depth":
             return (
                 f"count_outputs_by_logic_depth: "
@@ -579,7 +662,7 @@ class EDAAgent:
                 f"get_gate_info: {data.get('instance')} is {data.get('gate_type')} "
                 f"({pins})"
             )
-        elif tool_name in {"get_reachable_gates_from_net", "get_reachable_gates_from_gate"}:
+        elif tool_name in {"get_transitive_fanout_cone", "get_reachable_gates_from_gate"}:
             count = data.get("count", 0)
             if data.get("file_path"):
                 return f"{tool_name}: {count} reachable gates; full list in {data['file_path']}"
@@ -918,7 +1001,7 @@ class EDAAgent:
                             conv_log.log_netlist(self._engine.netlist)
 
                         compact_result_str = self._compact_tool_result_for_llm(
-                            result_str
+                            tool_name, result_str
                         )
                         messages.append(
                             {
@@ -936,6 +1019,64 @@ class EDAAgent:
     # Internal: LLM call
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_retry_delay(value: Optional[str]) -> Optional[float]:
+        """Parse Retry-After or OpenAI reset-header values into seconds."""
+        if not value:
+            return None
+        text = str(value).strip().lower()
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            pass
+
+        total = 0.0
+        pos = 0
+        units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+        for match in re.finditer(r"(\d+(?:\.\d+)?)(ms|s|m|h)", text):
+            if match.start() != pos:
+                break
+            total += float(match.group(1)) * units[match.group(2)]
+            pos = match.end()
+        if pos == len(text) and pos > 0:
+            return total
+
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            now = time.time()
+            return max(0.0, retry_at.timestamp() - now)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @classmethod
+    def _server_retry_delay(cls, exc: Exception) -> Optional[float]:
+        """Read server-directed retry timing from an OpenAI API error."""
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if not headers:
+            return None
+        for name in ("retry-after", "x-ratelimit-reset-tokens"):
+            delay = cls._parse_retry_delay(headers.get(name))
+            if delay is not None:
+                return delay
+        return None
+
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Return whether an SDK exception represents HTTP 429."""
+        return (
+            getattr(exc, "status_code", None) == 429
+            or exc.__class__.__name__ == "RateLimitError"
+        )
+
+    def _pace_llm_call(self) -> None:
+        """Enforce a minimum interval between all model-call attempts."""
+        elapsed = time.monotonic() - self._last_llm_call_started
+        remaining = self._llm_min_interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        self._last_llm_call_started = time.monotonic()
+
     def _call_llm(
         self, messages: List[Dict[str, Any]], timeout: int
     ) -> Any:
@@ -951,22 +1092,45 @@ class EDAAgent:
         Raises:
             RuntimeError: On API errors.
         """
-        try:
-            with _Timeout(timeout):
-                return self._client.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    temperature=self._temperature,
-                    max_tokens=self._max_tokens,
+        for attempt in range(self._rate_limit_max_retries + 1):
+            self._pace_llm_call()
+            try:
+                with _Timeout(timeout):
+                    return self._client.chat.completions.create(
+                        model=self._model,
+                        messages=messages,
+                        tools=TOOLS,
+                        tool_choice="auto",
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                    )
+            except TimeoutError:
+                raise RuntimeError(
+                    f"LLM call timed out after {timeout} seconds."
                 )
-        except TimeoutError:
-            raise RuntimeError(
-                f"LLM call timed out after {timeout} seconds."
-            )
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI API error: {exc}") from exc
+            except Exception as exc:
+                if not self._is_rate_limit_error(exc):
+                    raise RuntimeError(f"OpenAI API error: {exc}") from exc
+                if attempt >= self._rate_limit_max_retries:
+                    raise RuntimeError(
+                        "OpenAI API rate limit remained active after "
+                        f"{self._rate_limit_max_retries} retries: {exc}"
+                    ) from exc
+
+                server_delay = self._server_retry_delay(exc)
+                exponential_delay = min(
+                    self._rate_limit_initial_delay * (2 ** attempt),
+                    self._rate_limit_max_delay,
+                )
+                delay = (
+                    server_delay if server_delay is not None
+                    else exponential_delay
+                )
+                delay = min(delay, self._rate_limit_max_delay)
+                delay += random.uniform(0.0, self._rate_limit_jitter)
+                time.sleep(delay)
+
+        raise RuntimeError("OpenAI API retry loop ended unexpectedly.")
 
     # ------------------------------------------------------------------
     # Internal: tool dispatch
@@ -1087,8 +1251,7 @@ class EDAAgent:
             return {"path": path}
 
         if tool_name == "get_logic_cone":
-            cone = eng.get_logic_cone(args["output_signal"])
-            return {"gates": cone, "count": len(cone)}
+            return eng.get_logic_cone_report(args["output_signal"])
 
         if tool_name == "count_cone_gates":
             count = eng.count_cone_gates(args["output_signal"])
@@ -1127,7 +1290,7 @@ class EDAAgent:
             )
         if tool_name == "get_net_fanout":
             return eng.get_fanout_report(args["net_name"])
-        if tool_name == "get_reachable_gates_from_net":
+        if tool_name == "get_transitive_fanout_cone":
             return eng.get_reachable_gates_from_net(args["net_name"])
         if tool_name == "get_reachable_gates_from_gate":
             return eng.get_reachable_gates_from_gate(args["gate_name"])

@@ -34,8 +34,7 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Call this to write the current (possibly modified) netlist back to a "
                 "Verilog file on disk. Use after any transformation to persist changes. "
-                "If filepath is omitted, write '<case_name>_out.v' in the current working "
-                "directory, or 'design_out.v' if no testcase name is set."
+                "If filepath is omitted, write '<case_name>_out.v' in the current working directory"
             ),
             "parameters": {
                 "type": "object",
@@ -58,9 +57,7 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Count all gates in the currently loaded design "
                 "and return totals grouped by gate type."
-                "Invoke this whitout fail when asked for count all the gates "
-                "Invoke this whitout fail when asked to Compute the total gate count of the design. "
-
+                "Invoke this when asked for count all the gates or compute the total gate count of the design."
             ),
             "parameters": {
                 "type": "object",
@@ -489,10 +486,10 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "get_reachable_gates_from_net",
+            "name": "get_transitive_fanout_cone",
             "description": (
-                "Find ALL gates transitively reachable downstream from a SIGNAL or WIRE. "
-                "Use after resolve_name_type identifies the source as a signal. Traversal follows "
+                "Compute the transitive fanout cone of a SIGNAL or WIRE. Return every gate "
+                "reachable downstream, not only directly connected gates. Traversal follows "
                 "combinational fanout, includes reached DFFs, and stops at DFF boundaries. "
                 "For more than 10 gates, the complete list is written under ./_tmp/."
             ),
@@ -534,8 +531,9 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "get_net_fanout",
             "description": (
-                "Find all gate instances directly driven by a SIGNAL OR WIRE. Use for wording such as "
-                "'fanout of net n0'. Do not pass a gate instance such as g0; use get_gate_output_fanout. "
+                "Return only the immediate/direct fanout gates of a SIGNAL or WIRE. Do not use "
+                "this tool for a transitive fanout cone. Do not pass a gate instance such as g0; "
+                "use get_gate_output_fanout. "
                 "For 10 or fewer gates, returns the names inline so they must be listed in the response. "
                 "For more than 10 gates, writes the complete list to a text file in the current working "
                 "directory temp folder and returns only the count and file path."
@@ -604,7 +602,7 @@ TOOLS: List[Dict[str, Any]] = [
                 "List all flip-flop/DFF instances whose clock pin is exactly the given "
                 "clock signal. Use this exact tool for prompts like 'List all flip-flops "
                 "driven by clock n0' or 'which DFFs are clocked by clk?'. Do not use "
-                "get_reachable_gates_from_net for clock-pin queries. Results are "
+                "get_transitive_fanout_cone for clock-pin queries. Results are "
                 "reported as a total count plus a full-list file_path under ./_tmp/."
             ),
             "parameters": {
@@ -785,33 +783,6 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "balance_depth",
-            "description": (
-                "Call this to add buffers along paths so that all paths from source to each "
-                "sink have the same combinational depth. "
-                "Uses minimal buffer insertion. "
-                "Returns the number of buffers inserted."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Starting signal name.",
-                    },
-                    "sinks": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of sink signal names to equalise.",
-                    },
-                },
-                "required": ["source", "sinks"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "remove_dangling_gates",
             "description": (
                 "Call this to remove all gates and nets that do not transitively feed "
@@ -844,32 +815,6 @@ TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
-    # {
-    #     "type": "function",
-    #     "function": {
-    #         "name": "optimize_cone_depth",
-    #         "description": (
-    #             "Call this to restructure the logic cone of output_signal so its combinational "
-    #             "depth is at most max_depth. "
-    #             "Preserves functional equivalence. "
-    #             "Returns true if the depth constraint is met, false if it cannot be achieved."
-    #         ),
-    #         "parameters": {
-    #             "type": "object",
-    #             "properties": {
-    #                 "output_signal": {
-    #                     "type": "string",
-    #                     "description": "The output net whose cone should be optimised.",
-    #                 },
-    #                 "max_depth": {
-    #                     "type": "integer",
-    #                     "description": "Maximum allowed combinational depth after optimisation.",
-    #                 },
-    #             },
-    #             "required": ["output_signal", "max_depth"],
-    #         },
-    #     },
-    # },
     {
         "type": "function",
         "function": {

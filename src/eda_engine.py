@@ -1102,6 +1102,41 @@ class EDAEngine:
 
         return cone_gates
 
+    def get_logic_cone_report(
+        self, output_signal: str, inline_limit: int = 10
+    ) -> dict:
+        """Return a compact transitive-fanin report for an output signal."""
+        inline_limit = max(0, int(inline_limit))
+        gates = self.get_logic_cone(output_signal)
+        result = {
+            "output_signal": output_signal,
+            "count": len(gates),
+        }
+        if len(gates) <= inline_limit:
+            result["gates"] = gates
+            return result
+
+        safe_name = (
+            re.sub(r"[^A-Za-z0-9_.-]+", "_", output_signal).strip("_")
+            or "signal"
+        )
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix=f"fanin_{safe_name}_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(
+                f"# Transitive fanin gates for {output_signal} "
+                f"(count: {len(gates)})\n"
+            )
+            for gate_name in gates:
+                report.write(f"{gate_name}\n")
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
     def count_cone_gates(self, output_signal: str) -> int:
         """Return the number of gates in the logic cone of output_signal.
 
