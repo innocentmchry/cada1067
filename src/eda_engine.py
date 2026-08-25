@@ -1068,6 +1068,153 @@ class EDAEngine:
                     queue.append(path + [nxt])
         return None
 
+    def find_articulation_points(
+        self, source: str, sink: str
+    ) -> dict:
+        """Find all articulation points (cut gates) between source and sink in the combinational graph.
+
+        An articulation point is an intermediate gate instance such that removing it
+        disconnects all combinational paths from source to sink.
+
+        Args:
+            source: Starting signal name.
+            sink:   Ending signal name.
+
+        Returns:
+            Dictionary containing path existence, count, and list of articulation gates.
+        """
+        self._require_netlist()
+        self._resolve_signal(source)
+        self._resolve_signal(sink)
+        nl = self._netlist
+        assert nl is not None
+
+        if source == sink:
+            return {
+                "source": source,
+                "sink": sink,
+                "path_exists": True,
+                "count": 0,
+                "articulation_points": [],
+                "gates": [],
+                "message": f"Source and sink are the same signal ({source}). No intermediate articulation points exist.",
+            }
+
+        # Build efficient adjacency maps
+        signal_consumers: Dict[str, List[GateNode]] = {}
+        out2gate = self._build_output_to_gate()
+        for gate in nl.nodes.values():
+            for inp in gate.inputs:
+                signal_consumers.setdefault(inp, []).append(gate)
+
+        # 1. Forward reachability from source
+        forward_signals: Set[str] = {source}
+        forward_gates: Set[str] = set()
+        queue: deque[str] = deque([source])
+
+        while queue:
+            curr_sig = queue.popleft()
+            for gate in signal_consumers.get(curr_sig, []):
+                forward_gates.add(gate.name)
+                out_sig = gate.output
+                if out_sig not in forward_signals:
+                    forward_signals.add(out_sig)
+                    queue.append(out_sig)
+
+        if sink not in forward_signals:
+            return {
+                "source": source,
+                "sink": sink,
+                "path_exists": False,
+                "count": 0,
+                "articulation_points": [],
+                "gates": [],
+                "message": f"No combinational path exists between {source} and {sink}.",
+            }
+
+        # 2. Backward reachability from sink
+        backward_signals: Set[str] = {sink}
+        backward_gates: Set[str] = set()
+        queue = deque([sink])
+
+        while queue:
+            curr_sig = queue.popleft()
+            driver_name = out2gate.get(curr_sig)
+            if driver_name and driver_name in nl.nodes:
+                backward_gates.add(driver_name)
+                gate = nl.nodes[driver_name]
+                for inp in gate.inputs:
+                    if inp not in backward_signals:
+                        backward_signals.add(inp)
+                        queue.append(inp)
+
+        # 3. Active subgraph between source and sink
+        active_signals = forward_signals & backward_signals
+        active_gates = forward_gates & backward_gates
+
+        # Helper to test if sink is reachable from source when blocking a gate
+        def is_reachable_without_gate(blocked_gate: str) -> bool:
+            visited_sigs: Set[str] = {source}
+            q: deque[str] = deque([source])
+            while q:
+                curr = q.popleft()
+                if curr == sink:
+                    return True
+                for g in signal_consumers.get(curr, []):
+                    if g.name == blocked_gate or g.name not in active_gates:
+                        continue
+                    out_s = g.output
+                    if out_s not in active_signals:
+                        continue
+                    if out_s not in visited_sigs:
+                        visited_sigs.add(out_s)
+                        q.append(out_s)
+            return False
+
+        # 4. Find articulation gates
+        candidate_gates = active_gates
+        art_gates: List[str] = []
+        for cand_gate in candidate_gates:
+            if not is_reachable_without_gate(cand_gate):
+                art_gates.append(cand_gate)
+
+        # 5. Compute topological distance from source for sorting
+        min_depth: Dict[str, int] = {source: 0}
+        q_depth: deque[str] = deque([source])
+        while q_depth:
+            curr = q_depth.popleft()
+            d = min_depth[curr]
+            for g in signal_consumers.get(curr, []):
+                if g.name not in active_gates:
+                    continue
+                out_s = g.output
+                if out_s in active_signals:
+                    if out_s not in min_depth or min_depth[out_s] > d + 1:
+                        min_depth[out_s] = d + 1
+                        q_depth.append(out_s)
+
+        sorted_gates = sorted(
+            art_gates,
+            key=lambda g: (
+                min_depth.get(nl.nodes[g].output, 999999),
+                g,
+            ),
+        )
+
+        return {
+            "source": source,
+            "sink": sink,
+            "path_exists": True,
+            "count": len(sorted_gates),
+            "articulation_points": sorted_gates,
+            "gates": sorted_gates,
+            "message": (
+                f"Found {len(sorted_gates)} articulation gate(s) between {source} and {sink}: {', '.join(sorted_gates)}"
+                if sorted_gates
+                else f"Found 0 articulation points between {source} and {sink}."
+            ),
+        }
+
     def get_logic_cone(self, output_signal: str) -> List[str]:
         """Return all gate instance names that transitively feed output_signal.
 

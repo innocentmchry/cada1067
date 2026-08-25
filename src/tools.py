@@ -302,6 +302,34 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "find_articulation_points",
+            "description": (
+                "Find all articulation points (cut gates / mandatory intermediate gate instances) "
+                "in the combinational graph between a source signal and a sink signal. "
+                "Use this exact tool for prompts like 'Find all articulation points in the "
+                "combinational graph between n2 and n14' or 'List all cut/bottleneck gates "
+                "between source and sink'. Returns the list of gate instances that every "
+                "combinational path from source to sink must traverse."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Starting signal name (e.g. 'n2').",
+                    },
+                    "sink": {
+                        "type": "string",
+                        "description": "Ending signal name (e.g. 'n14').",
+                    },
+                },
+                "required": ["source", "sink"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_logic_cone",
             "description": (
                 "Call this to retrieve all gate instance names that directly or transitively "

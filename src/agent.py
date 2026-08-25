@@ -558,6 +558,15 @@ class EDAAgent:
                 f"{data.get('source')}->{data.get('sink')} via "
                 f"{data.get('through')} ({path_state})"
             )
+        elif tool_name == "find_articulation_points":
+            src = data.get("source", "?")
+            snk = data.get("sink", "?")
+            count = data.get("count", 0)
+            gates = ", ".join(data.get("articulation_points", []))
+            return (
+                f"find_articulation_points: {count} gate(s) between {src} and {snk}"
+                + (f" ({gates})" if gates else "")
+            )
         elif tool_name == "is_wire_cut_between_primary_ios":
             answer = "YES" if data.get("is_cut_between_primary_io") else "NO"
             return (
@@ -1249,6 +1258,11 @@ class EDAAgent:
                 args["source"], args["sink"], args["avoid"]
             )
             return {"path": path}
+
+        if tool_name == "find_articulation_points":
+            return eng.find_articulation_points(
+                args["source"], args["sink"]
+            )
 
         if tool_name == "get_logic_cone":
             return eng.get_logic_cone_report(args["output_signal"])
