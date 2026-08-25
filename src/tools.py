@@ -1309,7 +1309,13 @@ TOOLS: List[Dict[str, Any]] = [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "io_type": {
+                        "type": "string",
+                        "enum": ["all", "inputs", "outputs"],
+                        "description": "Optional filter: 'inputs' to list primary inputs only, 'outputs' to list primary outputs only, or 'all' (default).",
+                    }
+                },
                 "required": [],
             },
         },

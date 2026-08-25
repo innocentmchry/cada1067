@@ -1892,37 +1892,67 @@ class EDAEngine:
             "primary_outputs": output_ports,
         }
 
-    def _port_detail(self, name: str) -> dict:
+    def _port_detail(self, name: str, include_bits: bool = False) -> dict:
         """Return declared width/range metadata for one top-level port."""
         nl = self._netlist
         assert nl is not None
         wire = nl.wires.get(name)
         if wire is None:
-            return {"name": name, "width": 1, "range": None, "bits": [name]}
-        bits = self._expand_declared_signal(name)
-        return {
+            res: Dict[str, Any] = {"name": name, "width": 1, "range": None}
+            if include_bits:
+                res["bits"] = [name]
+            return res
+        res = {
             "name": name,
             "width": wire.width,
             "range": f"[{wire.msb}:{wire.lsb}]" if wire.is_bus else None,
-            "bits": bits,
         }
+        if include_bits:
+            res["bits"] = self._expand_declared_signal(name)
+        return res
 
-    def list_primary_ios(self) -> dict:
-        """Return primary input/output ports with declared bit widths."""
+    def list_primary_ios(
+        self,
+        io_type: Optional[str] = None,
+        include_bits: bool = False,
+    ) -> dict:
+        """Return primary input/output ports with declared bit widths.
+
+        Args:
+            io_type: Optional filter: 'inputs' (primary inputs only),
+                     'outputs' (primary outputs only), or 'all'/None (both).
+            include_bits: Whether to include explicit per-bit list (default False).
+        """
         self._require_netlist()
         nl = self._netlist
         assert nl is not None
 
-        primary_inputs = [self._port_detail(name) for name in nl.primary_inputs]
-        primary_outputs = [self._port_detail(name) for name in nl.primary_outputs]
-        return {
-            "primary_input_ports": len(primary_inputs),
-            "primary_output_ports": len(primary_outputs),
-            "primary_input_bits": sum(item["width"] for item in primary_inputs),
-            "primary_output_bits": sum(item["width"] for item in primary_outputs),
-            "primary_inputs": primary_inputs,
-            "primary_outputs": primary_outputs,
-        }
+        filter_type = str(io_type or "").strip().lower()
+        result: Dict[str, Any] = {}
+
+        if filter_type not in {"outputs", "po"}:
+            primary_inputs = [
+                self._port_detail(name, include_bits=include_bits)
+                for name in nl.primary_inputs
+            ]
+            result["primary_input_ports"] = len(primary_inputs)
+            result["primary_input_bits"] = sum(
+                item["width"] for item in primary_inputs
+            )
+            result["primary_inputs"] = primary_inputs
+
+        if filter_type not in {"inputs", "pi"}:
+            primary_outputs = [
+                self._port_detail(name, include_bits=include_bits)
+                for name in nl.primary_outputs
+            ]
+            result["primary_output_ports"] = len(primary_outputs)
+            result["primary_output_bits"] = sum(
+                item["width"] for item in primary_outputs
+            )
+            result["primary_outputs"] = primary_outputs
+
+        return result
 
     def find_zero_length_pi_po_paths(self) -> dict:
         """Return direct zero-gate paths where a PI is also a PO."""
