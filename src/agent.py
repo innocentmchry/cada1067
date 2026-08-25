@@ -75,7 +75,10 @@ _SYSTEM_PROMPT = (
     "expression like NAND(a,b), OR(a,b), or XOR(a,b) equals a target signal, use "
     "find_binary_gate_equivalent_pair; do not approximate this by listing existing "
     "gates of that type. For prompts asking to list flip-flops driven or clocked by "
-    "a named clock signal, use list_flip_flops_by_clock. For depth optimization "
+    "a named clock signal, use list_flip_flops_by_clock. For questions asking "
+    "to find all articulation points, cut vertices, or mandatory bottleneck nodes "
+    "between two signals in the combinational graph, use find_articulation_points. "
+    "For depth optimization "
     "where only one named cone must use a restricted gate set and the cost is whole-design "
     "maximum depth, use optimize_depth_preserving_cone_gate_set; when the cost is the "
     "depth of that cone itself, use optimize_cone_depth_preserving_gate_set; "
@@ -557,6 +560,16 @@ class EDAAgent:
                 f"path_passes_through: {answer} for "
                 f"{data.get('source')}->{data.get('sink')} via "
                 f"{data.get('through')} ({path_state})"
+            )
+        elif tool_name == "find_articulation_points":
+            src = data.get("source", "?")
+            snk = data.get("sink", "?")
+            sig_count = data.get("total_articulation_signals", 0)
+            sigs = ", ".join(data.get("articulation_signals", []))
+            gate_count = data.get("total_articulation_gates", 0)
+            return (
+                f"find_articulation_points: {sig_count} signal(s) ({sigs}), "
+                f"{gate_count} gate(s) between {src} and {snk}"
             )
         elif tool_name == "is_wire_cut_between_primary_ios":
             answer = "YES" if data.get("is_cut_between_primary_io") else "NO"
@@ -1249,6 +1262,11 @@ class EDAAgent:
                 args["source"], args["sink"], args["avoid"]
             )
             return {"path": path}
+
+        if tool_name == "find_articulation_points":
+            return eng.find_articulation_points(
+                args["source"], args["sink"]
+            )
 
         if tool_name == "get_logic_cone":
             return eng.get_logic_cone_report(args["output_signal"])
