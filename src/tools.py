@@ -304,12 +304,12 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "find_articulation_points",
             "description": (
-                "Find all articulation points (cut vertices / mandatory intermediate nodes) "
+                "Find all articulation points (cut gates / mandatory intermediate gate instances) "
                 "in the combinational graph between a source signal and a sink signal. "
                 "Use this exact tool for prompts like 'Find all articulation points in the "
-                "combinational graph between n2 and n14' or 'List all cut nodes / bottleneck nodes "
-                "between source and sink'. Returns both intermediate signals and gates that "
-                "every combinational path from source to sink must traverse."
+                "combinational graph between n2 and n14' or 'List all cut/bottleneck gates "
+                "between source and sink'. Returns the list of gate instances that every "
+                "combinational path from source to sink must traverse."
             ),
             "parameters": {
                 "type": "object",

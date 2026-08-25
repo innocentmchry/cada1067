@@ -564,12 +564,11 @@ class EDAAgent:
         elif tool_name == "find_articulation_points":
             src = data.get("source", "?")
             snk = data.get("sink", "?")
-            sig_count = data.get("total_articulation_signals", 0)
-            sigs = ", ".join(data.get("articulation_signals", []))
-            gate_count = data.get("total_articulation_gates", 0)
+            count = data.get("count", 0)
+            gates = ", ".join(data.get("articulation_points", []))
             return (
-                f"find_articulation_points: {sig_count} signal(s) ({sigs}), "
-                f"{gate_count} gate(s) between {src} and {snk}"
+                f"find_articulation_points: {count} gate(s) between {src} and {snk}"
+                + (f" ({gates})" if gates else "")
             )
         elif tool_name == "is_wire_cut_between_primary_ios":
             answer = "YES" if data.get("is_cut_between_primary_io") else "NO"

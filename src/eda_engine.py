@@ -1071,18 +1071,17 @@ class EDAEngine:
     def find_articulation_points(
         self, source: str, sink: str
     ) -> dict:
-        """Find all articulation points (cut vertices) between source and sink in the combinational graph.
+        """Find all articulation points (cut gates) between source and sink in the combinational graph.
 
-        An articulation point is an intermediate node (signal or gate) such that
-        removing it disconnects all combinational paths from source to sink.
+        An articulation point is an intermediate gate instance such that removing it
+        disconnects all combinational paths from source to sink.
 
         Args:
             source: Starting signal name.
             sink:   Ending signal name.
 
         Returns:
-            Dictionary containing path existence, lists of articulation signals and gates,
-            and an ordered list of articulation points.
+            Dictionary containing path existence, count, and list of articulation gates.
         """
         self._require_netlist()
         self._resolve_signal(source)
@@ -1095,12 +1094,9 @@ class EDAEngine:
                 "source": source,
                 "sink": sink,
                 "path_exists": True,
-                "total_articulation_points": 0,
-                "total_articulation_signals": 0,
-                "articulation_signals": [],
-                "total_articulation_gates": 0,
-                "articulation_gates": [],
-                "ordered_articulation_points": [],
+                "count": 0,
+                "articulation_points": [],
+                "gates": [],
                 "message": f"Source and sink are the same signal ({source}). No intermediate articulation points exist.",
             }
 
@@ -1130,12 +1126,9 @@ class EDAEngine:
                 "source": source,
                 "sink": sink,
                 "path_exists": False,
-                "total_articulation_points": 0,
-                "total_articulation_signals": 0,
-                "articulation_signals": [],
-                "total_articulation_gates": 0,
-                "articulation_gates": [],
-                "ordered_articulation_points": [],
+                "count": 0,
+                "articulation_points": [],
+                "gates": [],
                 "message": f"No combinational path exists between {source} and {sink}.",
             }
 
@@ -1159,13 +1152,8 @@ class EDAEngine:
         active_signals = forward_signals & backward_signals
         active_gates = forward_gates & backward_gates
 
-        # Helper to test if sink is reachable from source when blocking a node
-        def is_reachable(
-            blocked_signal: Optional[str] = None,
-            blocked_gate: Optional[str] = None,
-        ) -> bool:
-            if source == blocked_signal or sink == blocked_signal:
-                return False
+        # Helper to test if sink is reachable from source when blocking a gate
+        def is_reachable_without_gate(blocked_gate: str) -> bool:
             visited_sigs: Set[str] = {source}
             q: deque[str] = deque([source])
             while q:
@@ -1176,28 +1164,21 @@ class EDAEngine:
                     if g.name == blocked_gate or g.name not in active_gates:
                         continue
                     out_s = g.output
-                    if out_s == blocked_signal or out_s not in active_signals:
+                    if out_s not in active_signals:
                         continue
                     if out_s not in visited_sigs:
                         visited_sigs.add(out_s)
                         q.append(out_s)
             return False
 
-        # 4. Find articulation signals
-        candidate_signals = active_signals - {source, sink}
-        art_signals: List[str] = []
-        for cand_sig in candidate_signals:
-            if not is_reachable(blocked_signal=cand_sig):
-                art_signals.append(cand_sig)
-
-        # 5. Find articulation gates
+        # 4. Find articulation gates
         candidate_gates = active_gates
         art_gates: List[str] = []
         for cand_gate in candidate_gates:
-            if not is_reachable(blocked_gate=cand_gate):
+            if not is_reachable_without_gate(cand_gate):
                 art_gates.append(cand_gate)
 
-        # 6. Compute topological distance from source for sorting
+        # 5. Compute topological distance from source for sorting
         min_depth: Dict[str, int] = {source: 0}
         q_depth: deque[str] = deque([source])
         while q_depth:
@@ -1212,7 +1193,6 @@ class EDAEngine:
                         min_depth[out_s] = d + 1
                         q_depth.append(out_s)
 
-        sorted_signals = sorted(art_signals, key=lambda s: (min_depth.get(s, 999999), s))
         sorted_gates = sorted(
             art_gates,
             key=lambda g: (
@@ -1221,34 +1201,17 @@ class EDAEngine:
             ),
         )
 
-        ordered_points: List[dict] = []
-        all_items = [
-            (min_depth.get(s, 999999), 1, {"type": "signal", "name": s})
-            for s in sorted_signals
-        ] + [
-            (
-                min_depth.get(nl.nodes[g].output, 999999),
-                0,
-                {"type": "gate", "name": g},
-            )
-            for g in sorted_gates
-        ]
-        all_items.sort(key=lambda x: (x[0], x[1], x[2]["name"]))
-        ordered_points = [item[2] for item in all_items]
-
         return {
             "source": source,
             "sink": sink,
             "path_exists": True,
-            "total_articulation_points": len(sorted_signals) + len(sorted_gates),
-            "total_articulation_signals": len(sorted_signals),
-            "articulation_signals": sorted_signals,
-            "total_articulation_gates": len(sorted_gates),
-            "articulation_gates": sorted_gates,
-            "ordered_articulation_points": ordered_points,
+            "count": len(sorted_gates),
+            "articulation_points": sorted_gates,
+            "gates": sorted_gates,
             "message": (
-                f"Found {len(sorted_signals)} articulation signal(s) "
-                f"and {len(sorted_gates)} articulation gate(s) between {source} and {sink}."
+                f"Found {len(sorted_gates)} articulation gate(s) between {source} and {sink}: {', '.join(sorted_gates)}"
+                if sorted_gates
+                else f"Found 0 articulation points between {source} and {sink}."
             ),
         }
 
