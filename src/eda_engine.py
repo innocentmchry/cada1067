@@ -1137,6 +1137,209 @@ class EDAEngine:
         result["file_path"] = os.path.abspath(report.name)
         return result
 
+    def derive_boolean_equation(
+        self, output_signal: str, inline_limit: int = 20
+    ) -> dict:
+        """Derive the Boolean equation for an output signal or net in terms of primary/boundary inputs.
+
+        Handles combinational logic cones, direct DFF drivers, direct primary inputs,
+        and constant tie-offs.
+        """
+        self._require_netlist()
+        self._resolve_signal(output_signal)
+        nl = self._netlist
+        assert nl is not None
+
+        out2gate = self._build_output_to_gate()
+        driver = out2gate.get(output_signal)
+
+        def is_primary_input(sig: str) -> bool:
+            if sig in nl.primary_inputs:
+                return True
+            for pi in nl.primary_inputs:
+                wi = nl.wires.get(pi)
+                if wi and wi.is_bus:
+                    lo, hi = sorted((wi.lsb, wi.msb))
+                    if sig in [f"{pi}[{b}]" for b in range(lo, hi + 1)]:
+                        return True
+            return False
+
+        # 1. Direct Primary Input / Length-0 connection
+        if driver is None:
+            if is_primary_input(output_signal):
+                return {
+                    "output_signal": output_signal,
+                    "driver_type": "primary_input",
+                    "equation": f"{output_signal} = {output_signal}",
+                    "explanation": f"Output {output_signal} is directly connected to primary input {output_signal}.",
+                }
+            if output_signal in {"1'b0", "1'b1"}:
+                return {
+                    "output_signal": output_signal,
+                    "driver_type": "constant",
+                    "equation": f"{output_signal} = {output_signal}",
+                    "explanation": f"Signal {output_signal} is a constant tie-off ({output_signal}).",
+                }
+            return {
+                "output_signal": output_signal,
+                "driver_type": "undriven",
+                "equation": f"{output_signal} is undriven / unassigned",
+                "explanation": f"No driver found for {output_signal}.",
+            }
+
+        # 2. Driven directly by a DFF
+        if driver in nl.dffs:
+            dff = nl.dffs[driver]
+            return {
+                "output_signal": output_signal,
+                "driver_type": "dff",
+                "dff_instance": driver,
+                "dff_pins": {
+                    "ck": dff.ck,
+                    "rn": dff.rn,
+                    "sn": dff.sn,
+                    "d": dff.d,
+                    "q": dff.q,
+                },
+                "equation": f"{output_signal} = {driver}.Q",
+                "explanation": (
+                    f"Output {output_signal} is directly driven by register (DFF) {driver} pin Q. "
+                    f"Its data input D is driven by net {dff.d}."
+                ),
+            }
+
+        # 3. Combinational Gate Cone
+        cone_gates = self.get_logic_cone(output_signal)
+        if not cone_gates:
+            return {
+                "output_signal": output_signal,
+                "driver_type": "primary_input",
+                "equation": f"{output_signal} = {output_signal}",
+                "explanation": f"No combinational gates feed {output_signal}.",
+            }
+
+        # Topologically sort the gates from boundary inputs -> output
+        in_degree = {g: 0 for g in cone_gates}
+        successors: Dict[str, List[str]] = {g: [] for g in cone_gates}
+
+        for g in cone_gates:
+            out_net = nl.nodes[g].output
+            for other_g in cone_gates:
+                if out_net in nl.nodes[other_g].inputs:
+                    successors[g].append(other_g)
+                    in_degree[other_g] += 1
+
+        queue = deque([g for g in cone_gates if in_degree[g] == 0])
+        topo_order: List[str] = []
+        while queue:
+            cur = queue.popleft()
+            topo_order.append(cur)
+            for nxt in successors[cur]:
+                in_degree[nxt] -= 1
+                if in_degree[nxt] == 0:
+                    queue.append(nxt)
+
+        if len(topo_order) < len(cone_gates):
+            remaining = [g for g in cone_gates if g not in set(topo_order)]
+            topo_order.extend(remaining)
+
+        gate_breakdown: List[dict] = []
+        expr_map: Dict[str, str] = {}
+        boundary_inputs: Set[str] = set()
+
+        for g in topo_order:
+            node = nl.nodes[g]
+            gtype = node.gate_type.lower()
+            inps = node.inputs
+
+            for inp in inps:
+                if inp not in expr_map:
+                    boundary_inputs.add(inp)
+
+            # Local gate symbolic representation
+            if gtype == "not":
+                sym_eq = f"~{inps[0]}"
+            elif gtype == "buf":
+                sym_eq = f"{inps[0]}"
+            elif gtype == "and":
+                sym_eq = " * ".join(inps)
+            elif gtype == "nand":
+                sym_eq = f"~({' * '.join(inps)})"
+            elif gtype == "or":
+                sym_eq = " + ".join(inps)
+            elif gtype == "nor":
+                sym_eq = f"~({' + '.join(inps)})"
+            elif gtype == "xor":
+                sym_eq = " ^ ".join(inps)
+            elif gtype == "xnor":
+                sym_eq = f"~({' ^ '.join(inps)})"
+            else:
+                sym_eq = f"{gtype}({', '.join(inps)})"
+
+            gate_breakdown.append({
+                "gate": g,
+                "type": node.gate_type.upper(),
+                "output": node.output,
+                "inputs": list(inps),
+                "equation": f"{node.output} = {sym_eq}",
+            })
+
+            # Substituted expression
+            sub_inps = [expr_map.get(inp, inp) for inp in inps]
+            if gtype == "not":
+                sub_eq = f"~({sub_inps[0]})"
+            elif gtype == "buf":
+                sub_eq = f"{sub_inps[0]}"
+            elif gtype == "and":
+                sub_eq = "(" + " * ".join(sub_inps) + ")"
+            elif gtype == "nand":
+                sub_eq = "~(" + " * ".join(sub_inps) + ")"
+            elif gtype == "or":
+                sub_eq = "(" + " + ".join(sub_inps) + ")"
+            elif gtype == "nor":
+                sub_eq = "~(" + " + ".join(sub_inps) + ")"
+            elif gtype == "xor":
+                sub_eq = "(" + " ^ ".join(sub_inps) + ")"
+            elif gtype == "xnor":
+                sub_eq = "~(" + " ^ ".join(sub_inps) + ")"
+            else:
+                sub_eq = f"{gtype}(" + ", ".join(sub_inps) + ")"
+
+            expr_map[node.output] = sub_eq
+
+        final_substituted = expr_map.get(output_signal, output_signal)
+
+        result: Dict[str, Any] = {
+            "output_signal": output_signal,
+            "driver_type": "combinational",
+            "cone_gate_count": len(cone_gates),
+            "cone_gates": cone_gates,
+            "boundary_inputs": sorted(boundary_inputs),
+            "gate_breakdown": gate_breakdown[:inline_limit],
+            "total_gates_in_breakdown": len(gate_breakdown),
+            "equation": f"{output_signal} = {final_substituted}",
+        }
+
+        if len(gate_breakdown) > inline_limit:
+            report = tempfile.NamedTemporaryFile(
+                "w",
+                prefix=f"boolean_eq_{output_signal}_",
+                suffix=".txt",
+                dir=_workspace_temp_dir(),
+                delete=False,
+            )
+            with report:
+                report.write(f"# Boolean Derivation for {output_signal}\n")
+                report.write(f"# Total cone gates: {len(cone_gates)}\n")
+                report.write(f"# Boundary inputs: {', '.join(sorted(boundary_inputs))}\n\n")
+                report.write("## Gate Breakdown:\n")
+                for gb in gate_breakdown:
+                    report.write(f"{gb['gate']} ({gb['type']}): {gb['equation']}\n")
+                report.write(f"\n## Substituted Equation:\n{result['equation']}\n")
+            result["file_path"] = os.path.abspath(report.name)
+
+        return result
+
     def count_cone_gates(self, output_signal: str) -> int:
         """Return the number of gates in the logic cone of output_signal.
 

@@ -322,6 +322,32 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "derive_boolean_equation",
+            "description": (
+                "Derive the Boolean equation for an output signal or net in terms of its primary inputs "
+                "or boundary inputs. Use this exact tool for prompts like 'Derive the Boolean equation for "
+                "output <signal> in terms of its primary inputs'. It extracts the logic cone, gate equations, "
+                "step-by-step substitutions, and handles flip-flops (DFFs) and direct wire connections."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string",
+                        "description": "Target signal or net name (e.g. 'n7', 'n12', 'n22[0]').",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum number of gate equations to return inline (default: 20).",
+                    },
+                },
+                "required": ["output_signal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "count_cone_gates",
             "description": (
                 "Call this to count the number of gates in the logic cone of an output signal. "
