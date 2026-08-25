@@ -1079,11 +1079,16 @@ class EDAEngine:
         nl = self._netlist
         assert nl is not None
 
+        actual_output = output_signal
+        dff_q_to_d = {dff.q: dff.d for dff in nl.dffs.values()}
+        if output_signal in dff_q_to_d:
+            actual_output = dff_q_to_d[output_signal]
+
         out2gate = self._build_output_to_gate()
 
         cone_gates: List[str] = []
         visited_signals: Set[str] = set()
-        queue: deque[str] = deque([output_signal])
+        queue: deque[str] = deque([actual_output])
 
         while queue:
             sig = queue.popleft()
