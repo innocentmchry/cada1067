@@ -369,6 +369,7 @@ class EDAAgent:
             "get_max_depth_between_endpoint_classes",
             "find_path_avoiding",
             "path_passes_through",
+            "derive_boolean_equation",
         }
         preserve_path_keys = tool_name in witness_path_tools
         compacted = self._compact_value(
@@ -587,6 +588,13 @@ class EDAAgent:
                 f"{data.get('output')} = "
                 f"{data.get('depth')}"
             )
+        elif tool_name == "derive_boolean_equation":
+            sig = data.get("output_signal", "?")
+            dtype = data.get("driver_type", "")
+            eq = data.get("equation", "")
+            if dtype == "dff":
+                return f"derive_boolean_equation: {sig} driven by DFF {data.get('dff_instance')}.Q"
+            return f"derive_boolean_equation: {eq} ({data.get('cone_gate_count', 0)} cone gates)"
         elif tool_name == "get_logic_cone":
             count = data.get("count", 0)
             if data.get("file_path"):
@@ -1266,6 +1274,12 @@ class EDAAgent:
 
         if tool_name == "get_logic_cone":
             return eng.get_logic_cone_report(args["output_signal"])
+
+        if tool_name == "derive_boolean_equation":
+            return eng.derive_boolean_equation(
+                args["output_signal"],
+                int(args.get("inline_limit", 20)),
+            )
 
         if tool_name == "count_cone_gates":
             count = eng.count_cone_gates(args["output_signal"])
