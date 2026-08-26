@@ -5377,6 +5377,7 @@ sat -prove {prove_signal} {prove_value} -verify
             """)
 
         all_cells = {
+            "and":   ("A*B",     ["A", "B"]),
             "nand":  ("!(A*B)",  ["A", "B"]),
             "nor":   ("!(A+B)",  ["A", "B"]),
             "or":    ("A+B",     ["A", "B"]),
@@ -5701,7 +5702,9 @@ sat -prove {prove_signal} {prove_value} -verify
             return {"success": False, "reason": "allowed_gates cannot be empty."}
 
         allowed_set = set(normalized)
-        gates_before = len(nl.nodes)
+        combinational_gates_before = len(nl.nodes)
+        dff_count = len(nl.dffs)
+        total_gates_before = combinational_gates_before + dff_count
         source_types = sorted({
             node.gate_type
             for node in nl.nodes.values()
@@ -5749,8 +5752,13 @@ sat -prove {prove_signal} {prove_value} -verify
         return {
             "success": True,
             "allowed_gates": normalized,
-            "gates_before": gates_before,
-            "gates_after": len(nl.nodes),
+            # Whole-design gate totals include preserved DFFs, matching the
+            # count_gates API and ordinary meaning of "entire netlist".
+            "gates_before": total_gates_before,
+            "gates_after": len(nl.nodes) + len(nl.dffs),
+            "combinational_gates_before": combinational_gates_before,
+            "combinational_gates_after": len(nl.nodes),
+            "dff_count": len(nl.dffs),
             "gates_replaced": replaced,
         }
 
@@ -6009,6 +6017,86 @@ sat -prove {prove_signal} {prove_value} -verify
                 ("nor", ["_w1", "_w2"], "_w3"),
                 ("nor", ["_w3", "_w3"], "Y"),
             ]),
+            # Deterministic AND+NOT templates.  Keep these exact-set entries
+            # ahead of the ABC fallback so primitive decomposition does not
+            # depend on the installed Yosys/ABC version or mapping choices.
+            ("nand", frozenset({"and", "not"})): tmpl(["A", "B"], [
+                ("and", ["A", "B"], "_w0"),
+                ("not", ["_w0"], "Y"),
+            ]),
+            ("or", frozenset({"and", "not"})): tmpl(["A", "B"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["B"], "_w1"),
+                ("and", ["_w0", "_w1"], "_w2"),
+                ("not", ["_w2"], "Y"),
+            ]),
+            ("nor", frozenset({"and", "not"})): tmpl(["A", "B"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["B"], "_w1"),
+                ("and", ["_w0", "_w1"], "Y"),
+            ]),
+            ("xor", frozenset({"and", "not"})): tmpl(["A", "B"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["B"], "_w1"),
+                ("and", ["_w0", "_w1"], "_w2"),
+                ("not", ["_w2"], "_w3"),
+                ("and", ["A", "B"], "_w4"),
+                ("not", ["_w4"], "_w5"),
+                ("and", ["_w3", "_w5"], "Y"),
+            ]),
+            ("xnor", frozenset({"and", "not"})): tmpl(["A", "B"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["B"], "_w1"),
+                ("and", ["_w0", "_w1"], "_w2"),
+                ("not", ["_w2"], "_w3"),
+                ("and", ["A", "B"], "_w4"),
+                ("not", ["_w4"], "_w5"),
+                ("and", ["_w3", "_w5"], "_w6"),
+                ("not", ["_w6"], "Y"),
+            ]),
+            ("buf", frozenset({"and", "not"})): tmpl(["A"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["_w0"], "Y"),
+            ]),
+            # Deterministic OR+NOT templates (the De Morgan dual basis).
+            ("and", frozenset({"or", "not"})): tmpl(["A", "B"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["B"], "_w1"),
+                ("or", ["_w0", "_w1"], "_w2"),
+                ("not", ["_w2"], "Y"),
+            ]),
+            ("nand", frozenset({"or", "not"})): tmpl(["A", "B"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["B"], "_w1"),
+                ("or", ["_w0", "_w1"], "Y"),
+            ]),
+            ("nor", frozenset({"or", "not"})): tmpl(["A", "B"], [
+                ("or", ["A", "B"], "_w0"),
+                ("not", ["_w0"], "Y"),
+            ]),
+            ("xor", frozenset({"or", "not"})): tmpl(["A", "B"], [
+                ("or", ["A", "B"], "_w0"),
+                ("not", ["_w0"], "_w1"),
+                ("not", ["A"], "_w2"),
+                ("not", ["B"], "_w3"),
+                ("or", ["_w2", "_w3"], "_w4"),
+                ("not", ["_w4"], "_w5"),
+                ("or", ["_w5", "_w1"], "_w6"),
+                ("not", ["_w6"], "Y"),
+            ]),
+            ("xnor", frozenset({"or", "not"})): tmpl(["A", "B"], [
+                ("or", ["A", "B"], "_w0"),
+                ("not", ["_w0"], "_w1"),
+                ("not", ["A"], "_w2"),
+                ("not", ["B"], "_w3"),
+                ("or", ["_w2", "_w3"], "_w4"),
+                ("not", ["_w4"], "_w5"),
+                ("or", ["_w5", "_w1"], "Y"),
+            ]),
+            ("buf", frozenset({"or", "not"})): tmpl(["A"], [
+                ("not", ["A"], "_w0"),
+                ("not", ["_w0"], "Y"),
+            ]),
             # buf -> not(not(A))
             ("buf", frozenset({"not"})): tmpl(["A"], [
                 ("not", ["A"], "_w0"),
@@ -6023,11 +6111,18 @@ sat -prove {prove_signal} {prove_value} -verify
         if hk in _hardcoded:
             _SUBSTITUTION_TEMPLATE_CACHE[cache_key] = _hardcoded[hk]
             return _hardcoded[hk]
-        # Try subset match (e.g. target={"nand","not"} matches hardcoded {"nand"})
-        for (hs, ht), tmpl in _hardcoded.items():
-            if hs == source_type and ht.issubset(frozenset(target_types)):
-                _SUBSTITUTION_TEMPLATE_CACHE[cache_key] = tmpl
-                return tmpl
+        # Try compatible subset matches (e.g. target={"nand","not"} can use
+        # a NAND-only template).  Select deterministically by gate count, then
+        # target-set size/name, rather than relying on dictionary insertion order.
+        compatible = [
+            (len(candidate["gates"]), len(ht), tuple(sorted(ht)), candidate)
+            for (hs, ht), candidate in _hardcoded.items()
+            if hs == source_type and ht.issubset(frozenset(target_types))
+        ]
+        if compatible:
+            selected = min(compatible, key=lambda item: item[:3])[3]
+            _SUBSTITUTION_TEMPLATE_CACHE[cache_key] = selected
+            return selected
 
         # genlib format: each gate on one line — works with ABC's map command
         # and avoids the Liberty scalar-timing crash in abc -genlib path.

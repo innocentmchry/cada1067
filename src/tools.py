@@ -1296,7 +1296,7 @@ TOOLS: List[Dict[str, Any]] = [
                         "items": {"type": "string"},
                         "description": (
                             "List of gate types the cone may use after remapping. "
-                            "Valid values: 'nand', 'nor', 'or', 'not', 'xor', 'xnor', 'buf'. "
+                            "Valid values: 'and', 'nand', 'nor', 'or', 'not', 'xor', 'xnor', 'buf'. "
                             "Example: ['nand', 'not']"
                         ),
                     },

@@ -297,15 +297,15 @@ class EDAAgent:
     def _specific_gate_type_replacement_from_prompt(self) -> Optional[str]:
         """Infer a named source gate type for narrow cone replacement prompts."""
         prompt = getattr(self, "_active_user_message", "").lower()
-        if not any(word in prompt for word in ("replace", "convert")):
+        if not any(word in prompt for word in ("replace", "convert", "decompose")):
             return None
         if "cone" not in prompt:
             return None
         for gate_type in ("nand", "nor", "xnor", "xor", "and", "or", "buf", "not"):
             source_patterns = (
-                rf"\b(?:replace|convert)\s+(?:all\s+)?(?:2-input|two-input)?\s*{gate_type}\s+gates?\b",
-                rf"\b(?:replace|convert)\s+(?:all\s+)?(?:2-input|two-input)?\s*{gate_type}-gates?\b",
-                rf"\b(?:replace|convert)\s+(?:all\s+)?gates?\s+of\s+type\s+{gate_type}\b",
+                rf"\b(?:replace|convert|decompose)\s+(?:all\s+)?(?:2-input|two-input)?\s*{gate_type}\s+gates?\b",
+                rf"\b(?:replace|convert|decompose)\s+(?:all\s+)?(?:2-input|two-input)?\s*{gate_type}-gates?\b",
+                rf"\b(?:replace|convert|decompose)\s+(?:all\s+)?gates?\s+of\s+type\s+{gate_type}\b",
             )
             if any(re.search(pattern, prompt) for pattern in source_patterns):
                 return gate_type
@@ -744,6 +744,17 @@ class EDAAgent:
             else:
                 return f"replace_gate_type_in_cone: FAILED — {data.get('reason', 'unknown error')}"
         elif tool_name == "remap_cone_with_gates":
+            # The dispatcher may deliberately narrow an over-broad model call
+            # to replace_gate_type_in_cone when the prompt names one source
+            # gate type.  Format the history using the operation that actually
+            # ran, whose result schema has source_type/target_types/replaced,
+            # rather than the model-requested tool name.
+            if {
+                "source_type", "target_types", "replaced"
+            }.issubset(data):
+                return self._summarize_tool_result(
+                    "replace_gate_type_in_cone", result_str
+                )
             ok = data.get("success", False)
             if ok:
                 before = data.get("gates_before", "?")
@@ -761,10 +772,21 @@ class EDAAgent:
                 return f"remap_cone_with_gates: FAILED — {data.get('reason', 'unknown error')}"
         elif tool_name == "remap_design_with_gates":
             if data.get("success", False):
+                comb_before = data.get("combinational_gates_before")
+                comb_after = data.get("combinational_gates_after")
+                dff_count = data.get("dff_count")
+                detail = ""
+                if comb_before is not None and comb_after is not None:
+                    detail = (
+                        f" ({comb_before}→{comb_after} combinational"
+                        + (f", {dff_count} DFFs preserved" if dff_count is not None else "")
+                        + ")"
+                    )
                 return (
                     f"remap_design_with_gates: whole design remapped to "
                     f"{data.get('allowed_gates', [])} — "
-                    f"{data.get('gates_before', '?')} gates → {data.get('gates_after', '?')} gates"
+                    f"{data.get('gates_before', '?')} total gates → "
+                    f"{data.get('gates_after', '?')} total gates{detail}"
                 )
             return f"remap_design_with_gates: FAILED — {data.get('reason', 'unknown error')}"
         elif tool_name == "fraig_merge_equivalent_gates":
