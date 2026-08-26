@@ -370,6 +370,7 @@ class EDAAgent:
             "find_path_avoiding",
             "path_passes_through",
             "derive_boolean_equation",
+            "list_primary_ios",
         }
         preserve_path_keys = tool_name in witness_path_tools
         compacted = self._compact_value(
@@ -1219,7 +1220,7 @@ class EDAAgent:
             return eng.count_primary_ios()
 
         if tool_name == "list_primary_ios":
-            return eng.list_primary_ios()
+            return eng.list_primary_ios(args.get("io_type"))
 
 
         if tool_name == "set_testcase_name":
