@@ -665,6 +665,17 @@ class EDAAgent:
             if data.get("file_path"):
                 return f"{tool_name}: {count} direct gates; full list in {data['file_path']}"
             return f"{tool_name}: {count} direct gates ({', '.join(data.get('fanout', []))})"
+        elif tool_name == "get_net_connections":
+            drivers = [item.get("instance", "?") for item in data.get("drivers", [])]
+            loads = [item.get("instance", "?") for item in data.get("loads", [])]
+            summary = (
+                f"get_net_connections: {data.get('net_name', '?')} has "
+                f"{data.get('driver_count', 0)} driver(s) ({', '.join(drivers)}) and "
+                f"{data.get('load_count', 0)} load(s) ({', '.join(loads)})"
+            )
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            return summary
         elif tool_name == "resolve_name_type":
             return f"resolve_name_type: {data.get('name')} is {data.get('type')}"
         elif tool_name == "replace_gate":
@@ -1341,6 +1352,10 @@ class EDAAgent:
             )
         if tool_name == "get_net_fanout":
             return eng.get_fanout_report(args["net_name"])
+        if tool_name == "get_net_connections":
+            return eng.get_net_connections(
+                args["net_name"], int(args.get("inline_limit", 50))
+            )
         if tool_name == "get_transitive_fanout_cone":
             return eng.get_reachable_gates_from_net(args["net_name"])
         if tool_name == "get_reachable_gates_from_gate":

@@ -583,6 +583,32 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_net_connections",
+            "description": (
+                "Return ALL instances directly connected to a SIGNAL or WIRE, including both "
+                "the instance(s) that drive it and the gates/DFF ports that consume it. Use this "
+                "for wording such as 'all gates connected to signal n1' or 'what drives and uses n1'. "
+                "For downstream consumers only, use get_net_fanout instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "net_name": {
+                        "type": "string",
+                        "description": "Signal whose direct drivers and loads should be listed.",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum unique connected instances returned inline. Defaults to 50.",
+                    },
+                },
+                "required": ["net_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_net_fanout",
             "description": (
                 "Return only the immediate/direct fanout gates of a SIGNAL or WIRE. Do not use "

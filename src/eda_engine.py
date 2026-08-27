@@ -1801,6 +1801,89 @@ class EDAEngine:
         result["file_path"] = os.path.abspath(report.name)
         return result
 
+    def get_net_connections(self, net_name: str, inline_limit: int = 50) -> dict:
+        """Return all instances directly connected to a signal, by role.
+
+        Unlike fanout, this includes combinational/DFF drivers as well as
+        combinational/DFF loads and records the exact input or DFF port.
+        """
+        self._require_netlist()
+        self._resolve_signal(net_name)
+        nl = self._netlist
+        assert nl is not None
+
+        drivers: List[dict] = []
+        loads: List[dict] = []
+        for instance, node in nl.nodes.items():
+            if node.output == net_name:
+                drivers.append({
+                    "instance": instance,
+                    "gate_type": node.gate_type,
+                    "ports": ["output"],
+                })
+            indices = [index for index, signal in enumerate(node.inputs) if signal == net_name]
+            if indices:
+                loads.append({
+                    "instance": instance,
+                    "gate_type": node.gate_type,
+                    "input_indices": indices,
+                })
+
+        for instance, dff in nl.dffs.items():
+            if dff.q == net_name:
+                drivers.append({
+                    "instance": instance,
+                    "gate_type": "dff",
+                    "ports": ["Q"],
+                })
+            load_ports = [
+                port
+                for port, signal in (
+                    ("D", dff.d), ("CK", dff.ck), ("RN", dff.rn), ("SN", dff.sn)
+                )
+                if signal == net_name
+            ]
+            if load_ports:
+                loads.append({
+                    "instance": instance,
+                    "gate_type": "dff",
+                    "ports": load_ports,
+                })
+
+        drivers.sort(key=lambda item: item["instance"])
+        loads.sort(key=lambda item: item["instance"])
+        connected = sorted({
+            item["instance"] for item in [*drivers, *loads]
+        })
+        result = {
+            "net_name": net_name,
+            "driver_count": len(drivers),
+            "load_count": len(loads),
+            "count": len(connected),
+        }
+        if len(connected) <= inline_limit:
+            result.update({
+                "drivers": drivers,
+                "loads": loads,
+                "connected_gates": connected,
+            })
+            return result
+
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", net_name).strip("_") or "net"
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix=f"connections_{safe_name}_",
+            suffix=".jsonl",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            for role, items in (("driver", drivers), ("load", loads)):
+                for item in items:
+                    report.write(json.dumps({"role": role, **item}, sort_keys=True) + "\n")
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
     def resolve_name_type(self, name: str) -> dict:
         """Classify a name as a combinational gate, DFF, or signal."""
         self._require_netlist()
