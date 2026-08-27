@@ -295,11 +295,9 @@ class EDAAgent:
         return f"replace_gate: {first_count + second_count} gate(s) -> {first_type}"
 
     def _specific_gate_type_replacement_from_prompt(self) -> Optional[str]:
-        """Infer a named source gate type for narrow cone replacement prompts."""
+        """Infer a source gate type explicitly named in a replacement prompt."""
         prompt = getattr(self, "_active_user_message", "").lower()
         if not any(word in prompt for word in ("replace", "convert", "decompose")):
-            return None
-        if "cone" not in prompt:
             return None
         for gate_type in ("nand", "nor", "xnor", "xor", "and", "or", "buf", "not"):
             source_patterns = (
@@ -742,8 +740,9 @@ class EDAAgent:
                     before_count = before_counts.get(key, before_counts.get(gate_type))
                     after_count = after_counts.get(key, after_counts.get(gate_type))
                     if before_count is not None and after_count is not None:
+                        delta = after_count - before_count
                         count_parts.append(
-                            f"{key} {before_count}→{after_count}"
+                            f"{key} {before_count}→{after_count} ({delta:+d})"
                         )
                 count_detail = f"; {', '.join(count_parts)}" if count_parts else ""
                 return (
@@ -1504,8 +1503,15 @@ class EDAAgent:
             )
 
         if tool_name == "replace_gate_type_in_cone":
+            # Guard against a model argument that contradicts an explicitly
+            # named source type in the user's request (for example, passing
+            # XOR for "replace all XNOR gates").
+            source_type = (
+                self._specific_gate_type_replacement_from_prompt()
+                or args["source_type"]
+            )
             return eng.replace_gate_type_in_cone(
-                args["source_type"],
+                source_type,
                 args["target_types"],
                 args.get("output_signal"),
             )
