@@ -866,9 +866,8 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "remove_dangling_gates",
             "description": (
                 "Call this to remove all gates and nets that do not transitively feed "
-                "any primary output or DFF input. "
-                "Returns the number of gates removed. "
-                "Automatically called after every transformation."
+                "any primary output or DFF input. DFFs are preserved as combinational "
+                "boundaries. Returns the number of gates removed."
             ),
             "parameters": {
                 "type": "object",
