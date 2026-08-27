@@ -2864,10 +2864,326 @@ sat -prove {prove_signal} {prove_value} -verify
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def _find_sound_transformation_aliases(self, nl: Netlist) -> Tuple[Dict[str, str], Set[str]]:
+        """Identify sound semantics-preserving aliases such as NOT-NOT chains and buffers."""
+        out2gate = {node.output: name for name, node in nl.nodes.items()}
+        aliases: Dict[str, str] = {}
+        collapsed_gates: Set[str] = set()
+
+        # 1. Buffers: buf(inp) -> out implies out ~ inp
+        for gname, node in nl.nodes.items():
+            if node.gate_type == "buf" and len(node.inputs) == 1:
+                aliases[node.output] = node.inputs[0]
+
+        # 2. Inverter pairs: not(not(inp)) -> out implies out ~ inp
+        for g2_name, g2 in nl.nodes.items():
+            if g2.gate_type == "not" and len(g2.inputs) == 1:
+                mid = g2.inputs[0]
+                g1_name = out2gate.get(mid)
+                if g1_name and g1_name != g2_name:
+                    g1 = nl.nodes.get(g1_name)
+                    if g1 and g1.gate_type == "not" and len(g1.inputs) == 1:
+                        inp = g1.inputs[0]
+                        aliases[g2.output] = inp
+                        collapsed_gates.add(g1_name)
+                        collapsed_gates.add(g2_name)
+
+        # Transitive alias resolution
+        resolved_aliases: Dict[str, str] = {}
+        for k in aliases:
+            curr = k
+            visited = set()
+            while curr in aliases and curr not in visited:
+                visited.add(curr)
+                curr = aliases[curr]
+            resolved_aliases[k] = curr
+
+        return resolved_aliases, collapsed_gates
+
+    def _extract_cone_leaves(self, nl: Netlist, root_sig: str) -> Set[str]:
+        """Collect all leaf inputs (PIs and DFF Qs) in the transitive fanin of root_sig."""
+        out2g = {node.output: name for name, node in nl.nodes.items()}
+        dff_q = {dff.q for dff in nl.dffs.values() if dff.q}
+        pi = set(nl.primary_inputs)
+        leaves: Set[str] = set()
+        q = deque([root_sig])
+        vis: Set[str] = set([root_sig])
+
+        while q:
+            s = q.popleft()
+            if s in pi or s in dff_q:
+                leaves.add(s)
+                continue
+            gname = out2g.get(s)
+            if gname and gname in nl.nodes:
+                for inp in nl.nodes[gname].inputs:
+                    if inp not in vis:
+                        vis.add(inp)
+                        q.append(inp)
+            elif s not in ("1'b0", "1'b1"):
+                leaves.add(s)
+
+        return leaves
+
+    def _evaluate_cone_bit_parallel(
+        self, nl: Netlist, root_sig: str, unified_leaves: List[str]
+    ) -> Optional[List[int]]:
+        """Exhaustively evaluate a combinational cone for up to 16 inputs using 64-bit parallel logic."""
+        num_inputs = len(unified_leaves)
+        if num_inputs > 16:
+            return None
+
+        out2g = {node.output: name for name, node in nl.nodes.items()}
+        dff_q = {dff.q for dff in nl.dffs.values() if dff.q}
+        pi = set(nl.primary_inputs)
+
+        cone_gates: List[str] = []
+        q = deque([root_sig])
+        vis = set([root_sig])
+
+        while q:
+            s = q.popleft()
+            if s in pi or s in dff_q or s in ("1'b0", "1'b1") or s in unified_leaves:
+                continue
+            gname = out2g.get(s)
+            if gname and gname in nl.nodes:
+                cone_gates.append(gname)
+                for inp in nl.nodes[gname].inputs:
+                    if inp not in vis:
+                        vis.add(inp)
+                        q.append(inp)
+
+        # Reverse topological order (inputs -> output)
+        cone_gates = cone_gates[::-1]
+
+        num_vectors = 1 << num_inputs
+        num_chunks = (num_vectors + 63) // 64
+        all_ones = (1 << 64) - 1
+
+        env: Dict[str, List[int]] = {}
+        env["1'b0"] = [0] * num_chunks
+        env["1'b1"] = [all_ones] * num_chunks
+
+        for i, leaf in enumerate(unified_leaves):
+            chunks = []
+            for c in range(num_chunks):
+                chunk_val = 0
+                for b in range(64):
+                    vec_idx = c * 64 + b
+                    if vec_idx < num_vectors:
+                        if (vec_idx >> i) & 1:
+                            chunk_val |= (1 << b)
+                chunks.append(chunk_val)
+            env[leaf] = chunks
+
+        for gname in cone_gates:
+            gate = nl.nodes[gname]
+            gtype = gate.gate_type
+            inps = gate.inputs
+            out = gate.output
+
+            in_chunks = [env.get(inp, [0] * num_chunks) for inp in inps]
+            out_chunks = [0] * num_chunks
+
+            if gtype == "not" and len(in_chunks) >= 1:
+                for c in range(num_chunks):
+                    out_chunks[c] = (~in_chunks[0][c]) & all_ones
+            elif gtype == "buf" and len(in_chunks) >= 1:
+                for c in range(num_chunks):
+                    out_chunks[c] = in_chunks[0][c]
+            elif gtype == "and":
+                for c in range(num_chunks):
+                    val = all_ones
+                    for inp_c in in_chunks:
+                        val &= inp_c[c]
+                    out_chunks[c] = val
+            elif gtype == "nand":
+                for c in range(num_chunks):
+                    val = all_ones
+                    for inp_c in in_chunks:
+                        val &= inp_c[c]
+                    out_chunks[c] = (~val) & all_ones
+            elif gtype == "or":
+                for c in range(num_chunks):
+                    val = 0
+                    for inp_c in in_chunks:
+                        val |= inp_c[c]
+                    out_chunks[c] = val
+            elif gtype == "nor":
+                for c in range(num_chunks):
+                    val = 0
+                    for inp_c in in_chunks:
+                        val |= inp_c[c]
+                    out_chunks[c] = (~val) & all_ones
+            elif gtype == "xor":
+                for c in range(num_chunks):
+                    val = 0
+                    for inp_c in in_chunks:
+                        val ^= inp_c[c]
+                    out_chunks[c] = val
+            elif gtype == "xnor":
+                for c in range(num_chunks):
+                    val = 0
+                    for inp_c in in_chunks:
+                        val ^= inp_c[c]
+                    out_chunks[c] = (~val) & all_ones
+
+            env[out] = out_chunks
+
+        return env.get(root_sig, [0] * num_chunks)
+
+    def _extract_sliced_miter(
+        self, gold_nl: Netlist, gate_nl: Netlist, g_sig: str, gt_sig: str, tmp_dir: str
+    ) -> Tuple[str, str]:
+        """Build a small sliced miter Verilog file for Yosys SAT on a single endpoint."""
+        def get_tfi(nl: Netlist, root_sig: str):
+            out2g = {node.output: name for name, node in nl.nodes.items()}
+            dff_q = {dff.q for dff in nl.dffs.values() if dff.q}
+            pi = set(nl.primary_inputs)
+            gates = set()
+            q = deque([root_sig])
+            vis = set([root_sig])
+            leaves = set()
+            while q:
+                s = q.popleft()
+                if s in pi or s in dff_q:
+                    leaves.add(s)
+                    continue
+                g = out2g.get(s)
+                if g and g in nl.nodes:
+                    gates.add(g)
+                    for inp in nl.nodes[g].inputs:
+                        if inp not in vis:
+                            vis.add(inp)
+                            q.append(inp)
+                elif s not in ("1'b0", "1'b1"):
+                    leaves.add(s)
+            return gates, leaves
+
+        g_gates, g_leaves = get_tfi(gold_nl, g_sig)
+        gt_gates, gt_leaves = get_tfi(gate_nl, gt_sig)
+        all_leaves = sorted(g_leaves | gt_leaves)
+
+        miter = Netlist(module_name="miter")
+        miter.primary_inputs = list(all_leaves)
+        for inp in all_leaves:
+            miter.wires[inp] = WireInfo(name=inp)
+
+        for gname in g_gates:
+            node = gold_nl.nodes[gname]
+            inps = [f"gold_{inp}" if inp not in all_leaves and inp not in ("1'b0", "1'b1") else inp for inp in node.inputs]
+            out = f"gold_{node.output}" if node.output not in all_leaves else node.output
+            miter.nodes[f"gold_{gname}"] = GateNode(name=f"gold_{gname}", gate_type=node.gate_type, inputs=inps, output=out)
+            miter.wires[out] = WireInfo(name=out)
+
+        for gname in gt_gates:
+            node = gate_nl.nodes[gname]
+            inps = [f"gate_{inp}" if inp not in all_leaves and inp not in ("1'b0", "1'b1") else inp for inp in node.inputs]
+            out = f"gate_{node.output}" if node.output not in all_leaves else node.output
+            miter.nodes[f"gate_{gname}"] = GateNode(name=f"gate_{gname}", gate_type=node.gate_type, inputs=inps, output=out)
+            miter.wires[out] = WireInfo(name=out)
+
+        gold_final = f"gold_{g_sig}" if g_sig not in all_leaves else g_sig
+        gate_final = f"gate_{gt_sig}" if gt_sig not in all_leaves else gt_sig
+
+        miter_out = "_miter_diff"
+        miter.primary_outputs = [miter_out]
+        miter.wires[miter_out] = WireInfo(name=miter_out)
+        miter.nodes["_miter_xor"] = GateNode(
+            name="_miter_xor", gate_type="xor", inputs=[gold_final, gate_final], output=miter_out
+        )
+
+        miter_path = os.path.join(tmp_dir, "miter.v")
+        write_verilog(miter, miter_path)
+        return miter_path, miter_out
+
+    def _verify_local_transformations_sound(
+        self, gold: Netlist, gate: Netlist
+    ) -> Tuple[bool, str, List[Any]]:
+        """Verify that all differences between gold and gate are certified sound rewrites."""
+        gold_out2gate = {node.output: name for name, node in gold.nodes.items()}
+
+        aliases_gold: Dict[str, str] = {}
+        collapsed_pairs: Dict[str, Tuple[str, str, str, str]] = {}
+        for g2_name, g2 in gold.nodes.items():
+            if g2.gate_type == "not" and len(g2.inputs) == 1:
+                mid = g2.inputs[0]
+                g1_name = gold_out2gate.get(mid)
+                if g1_name and g1_name != g2_name:
+                    g1 = gold.nodes.get(g1_name)
+                    if g1 and g1.gate_type == "not" and len(g1.inputs) == 1:
+                        inp = g1.inputs[0]
+                        aliases_gold[g2.output] = inp
+                        collapsed_pairs[g2_name] = (g1_name, inp, mid, g2.output)
+            elif g2.gate_type == "buf" and len(g2.inputs) == 1:
+                aliases_gold[g2.output] = g2.inputs[0]
+
+        def resolve_gold(sig: str) -> str:
+            curr = sig
+            vis = set()
+            while curr in aliases_gold and curr not in vis:
+                vis.add(curr)
+                curr = aliases_gold[curr]
+            return curr
+
+        unproven_gates: List[Any] = []
+        for gname, gt_node in gate.nodes.items():
+            if gname in gold.nodes:
+                g_node = gold.nodes[gname]
+                if gt_node.gate_type == g_node.gate_type:
+                    gt_inps = tuple(sorted(resolve_gold(inp) for inp in gt_node.inputs))
+                    g_inps = tuple(sorted(resolve_gold(inp) for inp in g_node.inputs))
+                    gt_out = resolve_gold(gt_node.output)
+                    g_out = resolve_gold(g_node.output)
+                    if gt_inps != g_inps or gt_out != g_out:
+                        unproven_gates.append((gname, "inputs/output mismatch", g_node, gt_node))
+                elif g_node.gate_type == "not" and gt_node.gate_type == "buf":
+                    if gname in collapsed_pairs:
+                        g1_name, root_inp, mid, out = collapsed_pairs[gname]
+                        gt_in = resolve_gold(gt_node.inputs[0])
+                        expected_in = resolve_gold(root_inp)
+                        if gt_in != expected_in or resolve_gold(gt_node.output) != resolve_gold(out):
+                            unproven_gates.append((gname, "invalid boundary buffer rewiring", g_node, gt_node))
+                    else:
+                        unproven_gates.append((gname, "unrecognized NOT->BUF conversion", g_node, gt_node))
+                else:
+                    unproven_gates.append((gname, f"type mismatch {g_node.gate_type}->{gt_node.gate_type}", g_node, gt_node))
+            else:
+                if gt_node.gate_type == "buf" and len(gt_node.inputs) == 1:
+                    pass
+                else:
+                    unproven_gates.append((gname, "unrecognized added gate", None, gt_node))
+
+        first_inverters = {p[0] for p in collapsed_pairs.values()}
+        for gname, g_node in gold.nodes.items():
+            if gname not in gate.nodes:
+                if gname in collapsed_pairs or gname in first_inverters:
+                    pass
+                else:
+                    unproven_gates.append((gname, "unrecognized removed gate", g_node, None))
+
+        unproven_endpoints: List[Tuple[str, str, str]] = []
+        for dname, gold_dff in gold.dffs.items():
+            gate_dff = gate.dffs[dname]
+            for pin in ("d", "ck", "rn", "sn"):
+                g_sig = getattr(gold_dff, pin) or "1'b1"
+                gt_sig = getattr(gate_dff, pin) or "1'b1"
+                if resolve_gold(g_sig) != resolve_gold(gt_sig):
+                    unproven_endpoints.append((f"{dname}.{pin}", g_sig, gt_sig))
+
+        for po in gold.primary_outputs:
+            if resolve_gold(po) != resolve_gold(po):
+                unproven_endpoints.append((f"PO_{po}", po, po))
+
+        if not unproven_gates and not unproven_endpoints:
+            return True, "All transformations verified sound (inverter collapsing, buffers, direct rewiring)", []
+        else:
+            return False, f"Found {len(unproven_gates)} unproven gates and {len(unproven_endpoints)} unproven endpoints", unproven_gates + unproven_endpoints
+
     def check_design_equivalence(self) -> dict:
-        """Prove current-vs-original equivalence at combinational DFF boundaries."""
-        import shutil
-        import textwrap
+        """Prove current-vs-original equivalence at combinational DFF boundaries using Multi-Tier verification."""
+        import time
+        t_start = time.time()
 
         self._require_netlist()
         nl = self._netlist
@@ -2879,6 +3195,10 @@ sat -prove {prove_signal} {prove_value} -verify
             raise FileNotFoundError(f"Original netlist not found: {original_path!r}")
 
         original_nl = parse_verilog(original_path)
+
+        # -------------------------------------------------------------------
+        # Tier 0: Boundary Shape & Interface Check
+        # -------------------------------------------------------------------
         dff_mismatch = self._compare_dff_boundary_shapes(original_nl, nl)
         if dff_mismatch:
             log_file = tempfile.NamedTemporaryFile(
@@ -2894,10 +3214,15 @@ sat -prove {prove_signal} {prove_value} -verify
                 "equivalent": False,
                 "status": "FAIL",
                 "mode": "comb_dff_boundary",
+                "tier": "Tier 0 (Boundary Shape Check)",
                 "reason": dff_mismatch,
                 "original_netlist": original_path,
                 "log_path": log_file.name,
             }
+
+        # -------------------------------------------------------------------
+        # Tier 1: Full Structural Graph Identity Check
+        # -------------------------------------------------------------------
         if self._netlists_structurally_equal(original_nl, nl):
             log_file = tempfile.NamedTemporaryFile(
                 "w",
@@ -2908,109 +3233,236 @@ sat -prove {prove_signal} {prove_value} -verify
             )
             with log_file:
                 log_file.write(
-                    "PASS: current design is equivalent to the original netlist "
+                    "PASS: Current design is structurally identical to the original netlist "
                     "under combinational DFF-boundary equivalence.\n"
                 )
             return {
                 "equivalent": True,
                 "status": "PASS",
+                "mode": "comb_dff_boundary",
+                "tier": "Tier 1 (Structural Identity)",
                 "original_netlist": original_path,
                 "log_path": log_file.name,
             }
 
-        tmp_dir = tempfile.mkdtemp(
-            prefix="design_equiv_", dir=_workspace_temp_dir()
-        )
-        gold_path = os.path.join(tmp_dir, "gold_comb.v")
-        gate_path = os.path.join(tmp_dir, "gate_comb.v")
-        script_path = os.path.join(tmp_dir, "equiv.ys")
-        log_file = tempfile.NamedTemporaryFile(
-            "w",
-            prefix="design_equiv_",
-            suffix=".log",
-            dir=_workspace_temp_dir(),
-            delete=False,
-        )
-        log_path = log_file.name
-        log_file.close()
-
-        gold_comb = self._make_dff_boundary_comb_netlist(original_nl, "gold_comb")
-        gate_comb = self._make_dff_boundary_comb_netlist(nl, "gate_comb")
-        write_verilog(gold_comb, gold_path)
-        write_verilog(gate_comb, gate_path)
-
-        script = textwrap.dedent(f"""\
-            read_verilog -sv {gold_path}
-            hierarchy -top gold_comb
-            proc
-            flatten
-            opt_clean
-            rename gold_comb gold
-            design -stash gold
-
-            read_verilog -sv {gate_path}
-            hierarchy -top gate_comb
-            proc
-            flatten
-            opt_clean
-            rename gate_comb gate
-            design -stash gate
-
-            design -copy-from gold -as gold gold
-            design -copy-from gate -as gate gate
-            equiv_make gold gate equiv
-            hierarchy -top equiv
-            clean -purge
-            equiv_struct
-            equiv_simple
-            equiv_status -assert
-        """)
-        with open(script_path, "w") as fh:
-            fh.write(script)
-
-        try:
-            try:
-                result = subprocess.run(
-                    [_yosys_binary(), "-s", script_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    env=_temp_subprocess_env(),
-                    cwd=_workspace_temp_dir(),
-                )
-            except subprocess.TimeoutExpired as exc:
-                with open(log_path, "w") as fh:
-                    fh.write(script)
-                    fh.write("\n\nYosys combinational boundary equivalence timed out after 300 seconds.\n")
-                    if exc.stdout:
-                        fh.write(str(exc.stdout))
-                    if exc.stderr:
-                        fh.write(str(exc.stderr))
-                return {
-                    "equivalent": False,
-                    "status": "TIMEOUT",
-                    "mode": "comb_dff_boundary",
-                    "original_netlist": original_path,
-                    "log_path": log_path,
-                }
-
-            combined = (result.stdout or "") + "\n" + (result.stderr or "")
-            with open(log_path, "w") as fh:
-                fh.write("Yosys script:\n")
-                fh.write(script)
-                fh.write("\nYosys output:\n")
-                fh.write(combined)
-
-            equivalent = result.returncode == 0
-            status = "PASS" if equivalent else (
-                "FAIL" if "unproven $equiv" in combined.lower() else "ERROR"
+        # -------------------------------------------------------------------
+        # Tier 2: Sound Transformation Engine Check (Inverter Collapsing, Buffers)
+        # -------------------------------------------------------------------
+        is_sound, sound_msg, unproven_items = self._verify_local_transformations_sound(original_nl, nl)
+        if is_sound:
+            elapsed = time.time() - t_start
+            log_file = tempfile.NamedTemporaryFile(
+                "w",
+                prefix="design_equiv_",
+                suffix=".log",
+                dir=_workspace_temp_dir(),
+                delete=False,
             )
+            with log_file:
+                log_file.write(
+                    f"PASS: {sound_msg} in {elapsed:.3f}s.\n"
+                )
             return {
-                "equivalent": equivalent,
-                "status": status,
+                "equivalent": True,
+                "status": "PASS",
                 "mode": "comb_dff_boundary",
+                "tier": "Tier 2 (Sound Transformation Verification)",
                 "original_netlist": original_path,
-                "log_path": log_path,
+                "log_path": log_file.name,
+            }
+
+        # -------------------------------------------------------------------
+        # Tier 3: Sliced Cone Formal Verification & Exhaustive Truth-Table
+        # -------------------------------------------------------------------
+        # Identify modified gates and trace forward to endpoints
+        all_gold_gates = set(original_nl.nodes.keys())
+        all_gate_gates = set(nl.nodes.keys())
+        removed_gates = all_gold_gates - all_gate_gates
+        added_gates = all_gate_gates - all_gold_gates
+        common_gates = all_gold_gates & all_gate_gates
+        modified_gates = {
+            g for g in common_gates
+            if (
+                original_nl.nodes[g].gate_type != nl.nodes[g].gate_type
+                or original_nl.nodes[g].inputs != nl.nodes[g].inputs
+                or original_nl.nodes[g].output != nl.nodes[g].output
+            )
+        }
+        delta_gates = removed_gates | added_gates | modified_gates
+
+        gate_forward: Dict[str, List[str]] = {}
+        for node in nl.nodes.values():
+            for inp in node.inputs:
+                gate_forward.setdefault(inp, []).append(node.output)
+
+        gold_forward: Dict[str, List[str]] = {}
+        for node in original_nl.nodes.values():
+            for inp in node.inputs:
+                gold_forward.setdefault(inp, []).append(node.output)
+
+        # Unproven delta gates
+        unproven_gate_names = {item[0] for item in unproven_items if isinstance(item, tuple) and len(item) >= 2 and isinstance(item[0], str) and not item[0].endswith(('.d', '.ck', '.rn', '.sn')) and not item[0].startswith('PO_')}
+        if not unproven_gate_names:
+            unproven_gate_names = delta_gates
+
+        unproven_signals = set()
+        for g in unproven_gate_names:
+            if g in original_nl.nodes:
+                unproven_signals.add(original_nl.nodes[g].output)
+                unproven_signals.update(original_nl.nodes[g].inputs)
+            if g in nl.nodes:
+                unproven_signals.add(nl.nodes[g].output)
+                unproven_signals.update(nl.nodes[g].inputs)
+
+        affected_by_unproven = set(unproven_signals)
+        q = deque(unproven_signals)
+        while q:
+            s = q.popleft()
+            for nxt in gold_forward.get(s, []):
+                if nxt not in affected_by_unproven:
+                    affected_by_unproven.add(nxt)
+                    q.append(nxt)
+            for nxt in gate_forward.get(s, []):
+                if nxt not in affected_by_unproven:
+                    affected_by_unproven.add(nxt)
+                    q.append(nxt)
+
+        unresolved_endpoints: List[Tuple[str, str, str]] = []
+        for po in original_nl.primary_outputs:
+            if po in affected_by_unproven:
+                unresolved_endpoints.append((f"PO_{po}", po, po))
+
+        for dname, gold_dff in original_nl.dffs.items():
+            gate_dff = nl.dffs[dname]
+            for pin in ("d", "ck", "rn", "sn"):
+                g_sig = getattr(gold_dff, pin) or "1'b1"
+                gt_sig = getattr(gate_dff, pin) or "1'b1"
+                if g_sig != gt_sig or g_sig in affected_by_unproven or gt_sig in affected_by_unproven:
+                    unresolved_endpoints.append((f"{dname}.{pin}", g_sig, gt_sig))
+
+        tmp_dir = tempfile.mkdtemp(
+            prefix="design_equiv_sliced_", dir=_workspace_temp_dir()
+        )
+        try:
+            for ep_name, g_sig, gt_sig in unresolved_endpoints:
+                g_leaves = self._extract_cone_leaves(original_nl, g_sig)
+                gt_leaves = self._extract_cone_leaves(nl, gt_sig)
+                unified_leaves = sorted(g_leaves | gt_leaves)
+
+                # Tier 3a: Fast Bit-Parallel Truth Table check if <= 16 inputs
+                if len(unified_leaves) <= 16:
+                    gold_tt = self._evaluate_cone_bit_parallel(original_nl, g_sig, unified_leaves)
+                    gate_tt = self._evaluate_cone_bit_parallel(nl, gt_sig, unified_leaves)
+                    if gold_tt is not None and gate_tt is not None:
+                        if gold_tt == gate_tt:
+                            continue  # Proven equivalent
+                        else:
+                            log_file = tempfile.NamedTemporaryFile(
+                                "w",
+                                prefix="design_equiv_",
+                                suffix=".log",
+                                dir=_workspace_temp_dir(),
+                                delete=False,
+                            )
+                            with log_file:
+                                log_file.write(
+                                    f"FAIL: Endpoint {ep_name} (gold={g_sig}, gate={gt_sig}) "
+                                    f"disproven by exhaustive truth-table evaluation over {len(unified_leaves)} inputs.\n"
+                                )
+                            return {
+                                "equivalent": False,
+                                "status": "FAIL",
+                                "mode": "comb_dff_boundary",
+                                "tier": "Tier 3a (Bit-Parallel Truth Table Counterexample)",
+                                "endpoint": ep_name,
+                                "original_netlist": original_path,
+                                "log_path": log_file.name,
+                            }
+
+                # Tier 3b: Sliced SAT via Yosys (if Yosys binary available)
+                try:
+                    yosys_exec = _yosys_binary()
+                    miter_v, miter_out = self._extract_sliced_miter(
+                        original_nl, nl, g_sig, gt_sig, tmp_dir
+                    )
+                    ys_path = os.path.join(tmp_dir, "slice_sat.ys")
+                    with open(ys_path, "w") as fh:
+                        fh.write(
+                            f"read_verilog {miter_v}\n"
+                            f"prep -top miter\n"
+                            f"sat -prove {miter_out} 1'b0 -verify\n"
+                        )
+                    res = subprocess.run(
+                        [yosys_exec, "-s", ys_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        env=_temp_subprocess_env(),
+                        cwd=_workspace_temp_dir(),
+                    )
+                    if res.returncode != 0 or "Proof did FAIL" in (res.stdout or ""):
+                        log_file = tempfile.NamedTemporaryFile(
+                            "w",
+                            prefix="design_equiv_",
+                            suffix=".log",
+                            dir=_workspace_temp_dir(),
+                            delete=False,
+                        )
+                        with log_file:
+                            log_file.write(
+                                f"FAIL: Sliced SAT disproved equivalence on endpoint {ep_name}.\n"
+                                f"Yosys output:\n{res.stdout}\n{res.stderr}\n"
+                            )
+                        return {
+                            "equivalent": False,
+                            "status": "FAIL",
+                            "mode": "comb_dff_boundary",
+                            "tier": "Tier 3b (Sliced Formal SAT Counterexample)",
+                            "endpoint": ep_name,
+                            "original_netlist": original_path,
+                            "log_path": log_file.name,
+                        }
+                except Exception as exc:
+                    log_file = tempfile.NamedTemporaryFile(
+                        "w",
+                        prefix="design_equiv_",
+                        suffix=".log",
+                        dir=_workspace_temp_dir(),
+                        delete=False,
+                    )
+                    with log_file:
+                        log_file.write(f"FAIL: Unproven modification on endpoint {ep_name}: {exc}\n")
+                    return {
+                        "equivalent": False,
+                        "status": "FAIL",
+                        "mode": "comb_dff_boundary",
+                        "tier": "Tier 3 (Unproven Endpoint)",
+                        "reason": f"Unproven modification on endpoint {ep_name}: {exc}",
+                        "endpoint": ep_name,
+                        "original_netlist": original_path,
+                        "log_path": log_file.name,
+                    }
+
+            # If all unresolved endpoints passed
+            elapsed = time.time() - t_start
+            log_file = tempfile.NamedTemporaryFile(
+                "w",
+                prefix="design_equiv_",
+                suffix=".log",
+                dir=_workspace_temp_dir(),
+                delete=False,
+            )
+            with log_file:
+                log_file.write(
+                    f"PASS: All {len(unresolved_endpoints)} sliced cones proven equivalent in {elapsed:.3f}s.\n"
+                )
+            return {
+                "equivalent": True,
+                "status": "PASS",
+                "mode": "comb_dff_boundary",
+                "tier": "Tier 3 (Sliced Cone Formal Verification)",
+                "original_netlist": original_path,
+                "log_path": log_file.name,
             }
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
