@@ -64,10 +64,8 @@ _SYSTEM_PROMPT = (
     "that exact file path to the user along with the count instead of saying the full "
     "list is too long or can be found in the design. For reports of gates with "
     "constant inputs, use find_gates_with_constant_inputs unless the prompt explicitly "
-    "says the input is tied to a literal constant. For constant propagation of gates "
-    "with tied or reported constant inputs, or prompts referring to reported "
-    "gates, use the prior constant-input report or find_gates results and replace_gate "
-    "with explicit new_inputs for only those instances. If the relevant prior summary says zero gates were "
+    "says the input is tied to a literal constant. For constant propagation of "
+    "reported gates, use simplify_gates_with_constant_inputs. If the relevant prior summary says zero gates were "
     "found, report that there is nothing to simplify. Do not use replace_gate_type_in_cone "
     "for constant propagation or reported-gate simplification; it is only for intentional "
     "gate-library remapping of all gates of a type in a scope. For questions asking "
@@ -75,7 +73,10 @@ _SYSTEM_PROMPT = (
     "expression like NAND(a,b), OR(a,b), or XOR(a,b) equals a target signal, use "
     "find_binary_gate_equivalent_pair; do not approximate this by listing existing "
     "gates of that type. For prompts asking to list flip-flops driven or clocked by "
-    "a named clock signal, use list_flip_flops_by_clock. For depth optimization "
+    "a named clock signal, use list_flip_flops_by_clock. For highest/lowest fanout "
+    "across a signal class, use rank_signals_by_fanout. For functional symmetry "
+    "in two named inputs, use check_function_symmetry. For largest/smallest fanin "
+    "cones, use rank_signals_by_fanin_cone with gate_count. For depth optimization "
     "where only one named cone must use a restricted gate set and the cost is whole-design "
     "maximum depth, use optimize_depth_preserving_cone_gate_set; when the cost is the "
     "depth of that cone itself, use optimize_cone_depth_preserving_gate_set; "
@@ -365,6 +366,7 @@ class EDAAgent:
         witness_path_tools = {
             "get_max_depth",
             "get_max_depth_between_endpoint_classes",
+            "get_global_max_depth",
             "find_path_avoiding",
             "path_passes_through",
             "derive_boolean_equation",
@@ -545,10 +547,32 @@ class EDAAgent:
         elif tool_name == "get_max_depth":
             return f"get_max_depth: depth={data.get('depth')}"
         elif tool_name == "get_max_depth_between_endpoint_classes":
-            return (
+            if data.get("scope") == "global":
+                return self._summarize_tool_result(
+                    "get_global_max_depth", result_str
+                )
+            summary = (
                 f"get_max_depth_between_endpoint_classes: "
                 f"{data.get('source_class')} to {data.get('sink_class')} "
                 f"depth={data.get('depth')}"
+            )
+            if data.get("sink_class") == "DFF_D" and data.get("sink_instance"):
+                summary += (
+                    f"; {data.get('source_signal')} -> "
+                    f"{data.get('sink_instance')}.D "
+                    f"(D net {data.get('sink_pin_signal')})"
+                )
+            if data.get("source_class") == "DFF_Q" and data.get("source_instance"):
+                summary += (
+                    f"; source {data.get('source_instance')}.Q "
+                    f"(Q net {data.get('source_pin_signal')})"
+                )
+            return summary
+        elif tool_name == "get_global_max_depth":
+            return (
+                f"get_global_max_depth: depth={data.get('depth')} "
+                f"({data.get('source_class')} {data.get('source_signal')} to "
+                f"{data.get('sink_class')} {data.get('sink_signal')})"
             )
         elif tool_name == "path_passes_through":
             answer = "YES" if data.get("all_paths_pass_through") else "NO"
@@ -587,22 +611,59 @@ class EDAAgent:
                 f"{data.get('output')} = "
                 f"{data.get('depth')}"
             )
+        elif tool_name == "get_deepest_output_fanin_cone":
+            summary = (
+                f"get_deepest_output_fanin_cone: depth={data.get('max_depth')}; "
+                f"{data.get('tie_count', 0)} tied output bit(s)"
+            )
+            outputs = data.get("deepest_outputs", [])
+            if outputs:
+                summary += f": {', '.join(outputs)}"
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            return summary
         elif tool_name == "derive_boolean_equation":
             sig = data.get("output_signal", "?")
             dtype = data.get("driver_type", "")
-            eq = data.get("equation", "")
+            eq = data.get("equation") or data.get("boundary_state_equation", "")
+            if data.get("request_satisfied") is False:
+                boundaries = data.get("state_boundaries", [])
+                answer = str(data.get("answer", "PI-only expression unavailable")).rstrip(".")
+                detail = (
+                    f"; DFF-Q/state boundaries: {', '.join(boundaries)}"
+                    if boundaries else ""
+                )
+                return f"derive_boolean_equation: {answer}{detail}."
             if dtype == "dff":
-                return f"derive_boolean_equation: {sig} driven by DFF {data.get('dff_instance')}.Q"
+                d_input = data.get("dff_pins", {}).get("d", "?")
+                return (
+                    "derive_boolean_equation: PI-only expression unavailable; "
+                    f"{sig} is registered state; structural equation: {eq}; D={d_input}"
+                )
+            if data.get("primary_input_only_expression_available") is False:
+                boundaries = data.get("state_boundaries", [])
+                boundary_text = ", ".join(boundaries) if boundaries else "non-PI boundaries"
+                return (
+                    "derive_boolean_equation: PI-only expression unavailable; "
+                    f"depends on DFF-Q/state boundaries {boundary_text}; "
+                    f"boundary-state equation: {eq}"
+                )
             return f"derive_boolean_equation: {eq} ({data.get('cone_gate_count', 0)} cone gates)"
         elif tool_name == "get_logic_cone":
             count = data.get("count", 0)
+            scope = ""
+            if data.get("through_dff"):
+                scope = (
+                    f"; {data.get('output_signal')} resolved through "
+                    f"{data.get('through_dff')}.D to {data.get('resolved_output')}"
+                )
             if data.get("file_path"):
                 return (
-                    f"get_logic_cone: {count} transitive fanin gates; "
+                    f"get_logic_cone: {count} transitive fanin gates{scope}; "
                     f"full list in {data['file_path']}"
                 )
             return (
-                f"get_logic_cone: {count} transitive fanin gates "
+                f"get_logic_cone: {count} transitive fanin gates{scope} "
                 f"({', '.join(data.get('gates', []))})"
             )
         elif tool_name == "count_outputs_by_logic_depth":
@@ -643,6 +704,13 @@ class EDAAgent:
             if data.get("unknown_signal_count"):
                 summary += f"; {data['unknown_signal_count']} signal(s) unresolved"
             return summary
+        elif tool_name == "simplify_gates_with_constant_inputs":
+            return (
+                "simplify_gates_with_constant_inputs: simplified "
+                f"{data.get('simplified_gates', 0)} "
+                f"{str(data.get('gate_type', '?')).upper()} gate(s); "
+                f"replacements={data.get('replacement_breakdown', {})}"
+            )
         elif tool_name == "find_zero_length_pi_po_paths":
             paths = data.get("paths", [])
             names = [p.get("source") for p in paths[:5] if isinstance(p, dict)]
@@ -673,6 +741,36 @@ class EDAAgent:
             )
             if data.get("file_path"):
                 summary += f"; full list in {data['file_path']}"
+            return summary
+        elif tool_name == "rank_signals_by_fanout":
+            rankings = data.get("rankings") or data.get("sample_rankings") or []
+            ranking_text = "; ".join(
+                f"rank {item.get('rank')}: fanout {item.get('fanout')} "
+                f"({', '.join(item.get('signals', []))})"
+                for item in rankings
+            )
+            summary = (
+                f"rank_signals_by_fanout: examined "
+                f"{data.get('examined_signal_count', 0)} "
+                f"{data.get('signal_class', '?')} signal(s); {ranking_text}"
+            )
+            if data.get("file_path"):
+                summary += f"; full ranking in {data['file_path']}"
+            return summary
+        elif tool_name == "rank_signals_by_fanin_cone":
+            rankings = data.get("rankings") or data.get("sample_rankings") or []
+            ranking_text = "; ".join(
+                f"rank {item.get('rank')}: {data.get('metric')}={item.get('value')} "
+                f"({', '.join(item.get('signals', []))})"
+                for item in rankings
+            )
+            summary = (
+                f"rank_signals_by_fanin_cone: examined "
+                f"{data.get('examined_signal_count', 0)} "
+                f"{data.get('signal_class', '?')} signal(s); {ranking_text}"
+            )
+            if data.get("file_path"):
+                summary += f"; full ranking in {data['file_path']}"
             return summary
         elif tool_name == "resolve_name_type":
             return f"resolve_name_type: {data.get('name')} is {data.get('type')}"
@@ -809,6 +907,14 @@ class EDAAgent:
             return f"fraig_merge_equivalent_gates: FAILED"
         elif tool_name == "check_signal_equivalence":
             return f"check_signal_equivalence: equivalent={data.get('equivalent')}"
+        elif tool_name == "check_function_symmetry":
+            answer = "YES" if data.get("symmetric") else "NO"
+            return (
+                f"check_function_symmetry: {answer}; "
+                f"{data.get('output_signal')} symmetric in "
+                f"{data.get('input_a')} and {data.get('input_b')} "
+                f"(proof={data.get('proof')})"
+            )
         elif tool_name == "find_binary_gate_equivalent_pair":
             if data.get("exists"):
                 return (
@@ -1270,9 +1376,35 @@ class EDAAgent:
             return {"depth": depth, "path": path}
 
         if tool_name == "get_max_depth_between_endpoint_classes":
+            prompt = getattr(self, "_active_user_message", "").lower()
+            explicit_endpoint_scope = (
+                "primary input" in prompt
+                or "primary output" in prompt
+                or "dff" in prompt
+                or bool(re.search(r"\bfrom\b.+\bto\b", prompt))
+            )
+            whole_design_depth = (
+                "depth" in prompt
+                and not explicit_endpoint_scope
+                and any(
+                    phrase in prompt
+                    for phrase in (
+                        "in the design",
+                        "of the design",
+                        "entire design",
+                        "whole design",
+                        "global maximum",
+                    )
+                )
+            )
+            if whole_design_depth:
+                return eng.get_global_max_depth()
             return eng.get_max_depth_between_endpoint_classes(
                 args["source_class"], args["sink_class"]
             )
+
+        if tool_name == "get_global_max_depth":
+            return eng.get_global_max_depth()
 
         if tool_name == "is_gate_on_any_max_depth_path":
             return eng.is_gate_on_any_max_depth_path(args["gate_name"])
@@ -1281,6 +1413,8 @@ class EDAAgent:
             return eng.get_fanin_cone_depth(
                 args["output_signal"]
             )
+        if tool_name == "get_deepest_output_fanin_cone":
+            return eng.get_deepest_output_fanin_cone()
         if tool_name == "count_outputs_by_logic_depth":
             return eng.count_outputs_by_logic_depth(
                 args["operator"],
@@ -1309,10 +1443,34 @@ class EDAAgent:
             return eng.get_logic_cone_report(args["output_signal"])
 
         if tool_name == "derive_boolean_equation":
-            return eng.derive_boolean_equation(
+            result = eng.derive_boolean_equation(
                 args["output_signal"],
                 int(args.get("inline_limit", 20)),
             )
+            prompt = getattr(self, "_active_user_message", "")
+            asks_for_primary_inputs = bool(
+                re.search(r"\bprimary[ -]inputs?\b", prompt, re.IGNORECASE)
+            )
+            if (
+                asks_for_primary_inputs
+                and result.get("primary_input_only_expression_available") is False
+            ):
+                signal_name = result.get("output_signal", args["output_signal"])
+                state_boundaries = result.get("state_boundaries", [])
+                return {
+                    "output_signal": signal_name,
+                    "driver_type": result.get("driver_type"),
+                    "requested_basis": "primary_inputs",
+                    "request_satisfied": False,
+                    "primary_input_only_expression_available": False,
+                    "answer": (
+                        f"{signal_name} cannot be expressed solely in terms of current "
+                        "primary inputs because it depends on stored DFF-Q state."
+                    ),
+                    "state_boundaries": state_boundaries,
+                    "available_expression_basis": result.get("expression_basis"),
+                }
+            return result
 
         if tool_name == "count_cone_gates":
             count = eng.count_cone_gates(args["output_signal"])
@@ -1349,8 +1507,31 @@ class EDAAgent:
                 bool(args.get("functional", True)),
                 int(args.get("inline_limit", 50)),
             )
+        if tool_name == "simplify_gates_with_constant_inputs":
+            return eng.simplify_gates_with_constant_inputs(
+                args["gate_type"],
+                bool(args.get("functional", True)),
+                bool(args.get("use_last_report", True)),
+            )
         if tool_name == "get_net_fanout":
             return eng.get_fanout_report(args["net_name"])
+        if tool_name == "rank_signals_by_fanout":
+            return eng.rank_signals_by_fanout(
+                args["signal_class"],
+                args.get("order", "descending"),
+                int(args.get("limit", 1)),
+                bool(args.get("include_ties", True)),
+                int(args.get("inline_limit", 100)),
+            )
+        if tool_name == "rank_signals_by_fanin_cone":
+            return eng.rank_signals_by_fanin_cone(
+                args["signal_class"],
+                args.get("metric", "gate_count"),
+                args.get("order", "descending"),
+                int(args.get("limit", 1)),
+                bool(args.get("include_ties", True)),
+                int(args.get("inline_limit", 100)),
+            )
         if tool_name == "get_net_connections":
             return eng.get_net_connections(
                 args["net_name"], int(args.get("inline_limit", 50))
@@ -1435,9 +1616,22 @@ class EDAAgent:
             total = 0
 
             if not nets:
-                sigs = eng.list_signals()
-                # Candidate nets: wires + gate_outputs + dff_q + dff_d
-                nets = list(sigs.get("wires", [])) + list(sigs.get("gate_outputs", [])) + list(sigs.get("dff_q", [])) + list(sigs.get("dff_d", []))
+                # Work from the complete internal load-pin inventory.  The
+                # user-facing list_signals() result is intentionally compact
+                # and therefore must not be used for exhaustive processing.
+                nl = eng.netlist
+                candidates = {
+                    input_signal
+                    for node in nl.nodes.values()
+                    for input_signal in node.inputs
+                }
+                candidates.update(
+                    signal
+                    for dff in nl.dffs.values()
+                    for signal in (dff.ck, dff.rn, dff.sn, dff.d)
+                    if signal
+                )
+                nets = sorted(candidates - {"1'b0", "1'b1"})
 
             for net in nets:
                 try:
@@ -1554,6 +1748,10 @@ class EDAAgent:
         if tool_name == "check_signal_equivalence":
             equiv = eng.check_signal_equivalence(args["sig1"], args["sig2"])
             return {"equivalent": equiv}
+        if tool_name == "check_function_symmetry":
+            return eng.check_function_symmetry(
+                args["output_signal"], args["input_a"], args["input_b"]
+            )
 
         if tool_name == "find_binary_gate_equivalent_pair":
             return eng.find_binary_gate_equivalent_pair(

@@ -55,9 +55,10 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "count_gates",
             "description": (
-                "Count all gates in the currently loaded design "
-                "and return totals grouped by gate type."
-                "Invoke this when asked for count all the gates or compute the total gate count of the design."
+                "Count gates across the WHOLE currently loaded design and return the total "
+                "plus a breakdown by gate type. Use this for whole-design questions asking "
+                "how many gates of a particular type are in the netlist, such as "
+                "'How many AND gates are now in the reconstructed netlist?'"
             ),
             "parameters": {
                 "type": "object",
@@ -147,19 +148,51 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_deepest_output_fanin_cone",
+            "description": (
+                "Find the primary-output bit or tied bits with the deepest combinational "
+                "fanin cone. DFF outputs are treated as boundaries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_global_max_depth",
+            "description": (
+                "Return the maximum combinational depth anywhere in the design, across "
+                "PI/DFF-Q sources and PO/DFF-D sinks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_max_depth_between_endpoint_classes",
             "description": (
                 "Compute the maximum combinational logic depth across endpoint CLASSES. "
                 "Invoke this exact tool for requests such as 'from any primary input to any DFF D-pin' "
-                "or 'from any PI to any primary output'. This evaluates all matching endpoints in one "
-                "operation. Do not pass literal strings PI, DFF, or PO to get_max_depth."
+                "or 'from any PI to any primary output'. For maximum register-to-register "
+                "depth, use source_class DFF_Q and sink_class DFF_D. This evaluates all "
+                "matching endpoints in one "
+                "operation. For a DFF_D sink, sink_instance is the DFF, sink_pin is D, and "
+                "sink_pin_signal is the net connected to that D pin (not the DFF Q output). "
+                "Do not pass literal strings PI, DFF, or PO to get_max_depth."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "source_class": {
                         "type": "string",
-                        "enum": ["PI"],
+                        "enum": ["PI", "DFF_Q"],
                         "description": "Source endpoint class.",
                     },
                     "sink_class": {
@@ -330,10 +363,58 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "rank_signals_by_fanin_cone",
+            "description": (
+                "Rank every signal in a complete class by fanin-cone gate count or "
+                "logic depth. Use gate_count for largest/smallest cone questions and "
+                "depth only for deepest/shallowest questions. PO buses are expanded "
+                "into bits, and registered PO/DFF-Q signals use the same Q-to-D "
+                "next-state cone resolution as count_gate_types_in_cone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "signal_class": {
+                        "type": "string",
+                        "enum": ["PO", "DFF_D", "DFF_Q", "GATE_OUTPUT"],
+                        "description": "Complete class of signals to rank.",
+                    },
+                    "metric": {
+                        "type": "string",
+                        "enum": ["gate_count", "depth"],
+                        "description": "Ranking metric; largest cone means gate_count.",
+                    },
+                    "order": {
+                        "type": "string",
+                        "enum": ["descending", "ascending"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of distinct metric ranks to return.",
+                    },
+                    "include_ties": {
+                        "type": "boolean",
+                        "description": "Return all signals tied at selected ranks.",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum signals inline before writing a TSV file.",
+                    },
+                },
+                "required": ["signal_class", "metric"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_logic_cone",
             "description": (
                 "Call this to retrieve all gate instance names that directly or transitively "
-                "feed (drive) the given output signal. Returns the list of gate instance names."
+                "feed (drive) the given output signal. When the requested output is a "
+                "DFF-Q signal, the user-facing report resolves it to that DFF's D-pin "
+                "next-state combinational cone, consistently with count_gate_types_in_cone. "
+                "Returns the gate names inline or in a file for a large cone."
             ),
             "parameters": {
                 "type": "object",
@@ -355,7 +436,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "Derive the Boolean equation for an output signal or net in terms of its primary inputs "
                 "or boundary inputs. Use this exact tool for prompts like 'Derive the Boolean equation for "
                 "output <signal> in terms of its primary inputs'. It extracts the logic cone, gate equations, "
-                "step-by-step substitutions, and handles flip-flops (DFFs) and direct wire connections."
+                "step-by-step substitutions, and handles flip-flops (DFFs) and direct wire connections. "
+                "If a PI-only expression is unavailable, report that before any boundary-input equation."
             ),
             "parameters": {
                 "type": "object",
@@ -627,6 +709,47 @@ TOOLS: List[Dict[str, Any]] = [
                     }
                 },
                 "required": ["net_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rank_signals_by_fanout",
+            "description": (
+                "Rank every signal in a complete signal class by direct load-pin fanout. "
+                "Use this for highest/lowest or top-N fanout comparisons across primary "
+                "inputs, DFF-Q signals, gate outputs, or all driven signals. Primary-input "
+                "buses are expanded into individual bits. Do not use list_signals samples "
+                "for exhaustive fanout ranking; use get_net_fanout for one named net."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "signal_class": {
+                        "type": "string",
+                        "enum": ["PI", "DFF_Q", "GATE_OUTPUT", "ALL_DRIVEN"],
+                        "description": "Complete class of signals to rank.",
+                    },
+                    "order": {
+                        "type": "string",
+                        "enum": ["descending", "ascending"],
+                        "description": "Descending for highest fanout; ascending for lowest.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Number of distinct fanout ranks to return. Defaults to 1.",
+                    },
+                    "include_ties": {
+                        "type": "boolean",
+                        "description": "Return every signal tied at each selected rank. Defaults to true.",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum returned signals inline before writing a TSV file.",
+                    },
+                },
+                "required": ["signal_class"],
             },
         },
     },
@@ -1003,6 +1126,37 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "simplify_gates_with_constant_inputs",
+            "description": (
+                "Simplify gates previously reported with literal or proven functional "
+                "constant inputs while preserving their output nets. Use this for "
+                "requests to propagate constant inputs through reported NAND/AND/OR/"
+                "NOR/XOR/XNOR/NOT/BUF gates. It reuses a compatible complete prior "
+                "report when available and otherwise performs the functional analysis."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "gate_type": {
+                        "type": "string",
+                        "description": "Reported gate type to simplify, such as 'nand'.",
+                    },
+                    "functional": {
+                        "type": "boolean",
+                        "description": "Use formally proven functional constants as well as literals. Defaults to true.",
+                    },
+                    "use_last_report": {
+                        "type": "boolean",
+                        "description": "Reuse the compatible complete preceding report. Defaults to true.",
+                    },
+                },
+                "required": ["gate_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "find_instances_by_name_pattern",
             "description": (
                 "Call this to search for gate instances by gate type and/or instance name pattern. "
@@ -1049,6 +1203,37 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["signal_name", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_function_symmetry",
+            "description": (
+                "Prove whether the Boolean function at one output signal is symmetric "
+                "with respect to two scalar primary inputs or primary-input bits. This "
+                "checks invariance when the two input values are swapped. Use this for "
+                "symmetry questions; do not compare the output separately to each input "
+                "with check_signal_equivalence. DFF-Q values are independent boundaries."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "output_signal": {
+                        "type": "string",
+                        "description": "Signal whose Boolean function is checked.",
+                    },
+                    "input_a": {
+                        "type": "string",
+                        "description": "First scalar PI or PI bit, such as n3.",
+                    },
+                    "input_b": {
+                        "type": "string",
+                        "description": "Second scalar PI or PI bit, such as n9[0].",
+                    },
+                },
+                "required": ["output_signal", "input_a", "input_b"],
             },
         },
     },

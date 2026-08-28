@@ -175,6 +175,8 @@ class EDAEngine:
         self._allowed_gates_constraint: Optional[List[str]] = None
         self._original_netlist_path: Optional[str] = None
         self._last_constant_input_report: Optional[dict] = None
+        self._last_constant_input_matches: Optional[List[dict]] = None
+        self._last_constant_input_signature: Optional[tuple] = None
 
     # ------------------------------------------------------------------
     # Netlist lifecycle
@@ -185,6 +187,9 @@ class EDAEngine:
         self._netlist = parse_verilog(filepath)
         self._original_netlist_path = os.path.abspath(filepath)
         self._allowed_gates_constraint = None
+        self._last_constant_input_report = None
+        self._last_constant_input_matches = None
+        self._last_constant_input_signature = None
         return self._netlist
 
     def save(self, filepath: Optional[str] = None) -> None:
@@ -413,6 +418,69 @@ class EDAEngine:
             "depth": self._fanin_depth(output_signal)
         }
 
+    def get_deepest_output_fanin_cone(self) -> dict:
+        """Return all primary-output bits tied for maximum fanin depth."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        output_bits: List[str] = []
+        for output_name in nl.primary_outputs:
+            wire = nl.wires.get(output_name)
+            if wire and wire.is_bus:
+                lo = min(wire.msb, wire.lsb)
+                hi = max(wire.msb, wire.lsb)
+                output_bits.extend(
+                    f"{output_name}[{bit}]" for bit in range(lo, hi + 1)
+                )
+            else:
+                output_bits.append(output_name)
+
+        if not output_bits:
+            return {
+                "max_depth": -1,
+                "deepest_outputs": [],
+                "tie_count": 0,
+                "total_outputs": 0,
+            }
+
+        memo: Dict[str, int] = {}
+        depths = {
+            output_name: self._fanin_depth(output_name, memo)
+            for output_name in output_bits
+        }
+        max_depth = max(depths.values())
+        deepest_outputs = [
+            output_name
+            for output_name in output_bits
+            if depths[output_name] == max_depth
+        ]
+        result = {
+            "max_depth": max_depth,
+            "tie_count": len(deepest_outputs),
+            "total_outputs": len(output_bits),
+        }
+        if len(deepest_outputs) <= 50:
+            result["deepest_outputs"] = deepest_outputs
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="deepest_output_fanin_cones_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(
+                f"# Output bits at maximum fanin depth {max_depth} "
+                f"(count: {len(deepest_outputs)})\n"
+            )
+            for output_name in deepest_outputs:
+                report.write(f"{output_name}\n")
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
     def count_outputs_by_logic_depth(self, operator: str, threshold: int) -> dict:
         """Count primary-output bits whose combinational fanin depth matches a predicate."""
         self._require_netlist()
@@ -552,8 +620,8 @@ class EDAEngine:
 
         source_class = source_class.upper()
         sink_class = sink_class.upper()
-        if source_class != "PI":
-            raise ValueError("Currently supported source_class is 'PI'.")
+        if source_class not in {"PI", "DFF_Q"}:
+            raise ValueError("source_class must be 'PI' or 'DFF_Q'.")
         if sink_class not in {"DFF_D", "PO"}:
             raise ValueError("sink_class must be 'DFF_D' or 'PO'.")
 
@@ -564,20 +632,24 @@ class EDAEngine:
                 return [f"{name}[{bit}]" for bit in range(lo, hi + 1)]
             return [name]
 
-        pi_signals: Set[str] = set()
-        for name in nl.primary_inputs:
-            pi_signals.update(expand_declared(name))
-            pi_signals.add(name)
+        if source_class == "PI":
+            source_signals = {
+                signal
+                for name in nl.primary_inputs
+                for signal in expand_declared(name)
+            }
+        else:
+            source_signals = {dff.q for dff in nl.dffs.values() if dff.q}
 
         comb_driver = {node.output: node for node in nl.nodes.values()}
         memo: Dict[str, Optional[int]] = {}
         parent: Dict[str, str] = {}
         active: Set[str] = set()
 
-        def longest_from_pi(signal_name: str) -> Optional[int]:
+        def longest_from_source(signal_name: str) -> Optional[int]:
             if signal_name in memo:
                 return memo[signal_name]
-            if signal_name in pi_signals:
+            if signal_name in source_signals:
                 memo[signal_name] = 0
                 return 0
             if signal_name in {"1'b0", "1'b1"} or signal_name in active:
@@ -593,7 +665,7 @@ class EDAEngine:
             candidates = [
                 (depth, inp)
                 for inp in node.inputs
-                if (depth := longest_from_pi(inp)) is not None
+                if (depth := longest_from_source(inp)) is not None
             ]
             active.discard(signal_name)
             if not candidates:
@@ -619,13 +691,17 @@ class EDAEngine:
             ]
 
         best: Optional[Tuple[int, str, str]] = None
+        best_endpoint_ties = 0
         for endpoint_name, endpoint_signal in endpoints:
-            depth = longest_from_pi(endpoint_signal)
+            depth = longest_from_source(endpoint_signal)
             if depth is None:
                 continue
             candidate = (depth, endpoint_name, endpoint_signal)
             if best is None or candidate[0] > best[0]:
                 best = candidate
+                best_endpoint_ties = 1
+            elif candidate[0] == best[0]:
+                best_endpoint_ties += 1
 
         if best is None:
             return {
@@ -640,13 +716,136 @@ class EDAEngine:
         while path[-1] in parent:
             path.append(parent[path[-1]])
         path.reverse()
-        return {
+        result = {
             "source_class": source_class,
             "sink_class": sink_class,
             "depth": depth,
             "source_signal": path[0],
             "sink_name": endpoint_name,
             "sink_signal": endpoint_signal,
+            "max_depth_sink_tie_count": best_endpoint_ties,
+            "path": path,
+        }
+        if source_class == "DFF_Q":
+            source_dff = next(
+                (
+                    instance
+                    for instance, dff in nl.dffs.items()
+                    if dff.q == path[0]
+                ),
+                None,
+            )
+            result.update(
+                {
+                    "source_instance": source_dff,
+                    "source_pin": "Q",
+                    "source_pin_signal": path[0],
+                }
+            )
+        if sink_class == "DFF_D":
+            result.update(
+                {
+                    "sink_instance": endpoint_name,
+                    "sink_pin": "D",
+                    "sink_pin_signal": endpoint_signal,
+                }
+            )
+        return result
+
+    def get_global_max_depth(self) -> dict:
+        """Return the longest valid combinational boundary-to-boundary path."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        def expand_declared(name: str) -> List[str]:
+            wi = nl.wires.get(name)
+            if wi and wi.is_bus:
+                lo, hi = sorted((wi.lsb, wi.msb))
+                return [f"{name}[{bit}]" for bit in range(lo, hi + 1)]
+            return [name]
+
+        pi_signals: Set[str] = set()
+        for name in nl.primary_inputs:
+            pi_signals.update(expand_declared(name))
+        dff_q_signals = {dff.q for dff in nl.dffs.values() if dff.q}
+        source_signals = pi_signals | dff_q_signals
+
+        endpoints: List[Tuple[str, str, str]] = []
+        for output_name in nl.primary_outputs:
+            endpoints.extend(
+                ("PO", signal_name, signal_name)
+                for signal_name in expand_declared(output_name)
+            )
+        endpoints.extend(
+            ("DFF_D", instance_name, dff.d)
+            for instance_name, dff in sorted(nl.dffs.items())
+            if dff.d
+        )
+
+        comb_driver = {node.output: node for node in nl.nodes.values()}
+        memo: Dict[str, Optional[int]] = {}
+        parent: Dict[str, str] = {}
+        active: Set[str] = set()
+
+        def longest_from_boundary(signal_name: str) -> Optional[int]:
+            if signal_name in memo:
+                return memo[signal_name]
+            if signal_name in source_signals:
+                memo[signal_name] = 0
+                return 0
+            if signal_name in {"1'b0", "1'b1"} or signal_name in active:
+                memo[signal_name] = None
+                return None
+
+            node = comb_driver.get(signal_name)
+            if node is None:
+                memo[signal_name] = None
+                return None
+
+            active.add(signal_name)
+            candidates = [
+                (depth, input_signal)
+                for input_signal in node.inputs
+                if (depth := longest_from_boundary(input_signal)) is not None
+            ]
+            active.discard(signal_name)
+            if not candidates:
+                memo[signal_name] = None
+                return None
+
+            input_depth, input_signal = max(candidates, key=lambda item: item[0])
+            memo[signal_name] = input_depth + 1
+            parent[signal_name] = input_signal
+            return memo[signal_name]
+
+        best: Optional[Tuple[int, str, str, str]] = None
+        for sink_class, sink_name, sink_signal in endpoints:
+            depth = longest_from_boundary(sink_signal)
+            if depth is None:
+                continue
+            candidate = (depth, sink_class, sink_name, sink_signal)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+        if best is None:
+            return {"scope": "global", "depth": -1, "path": []}
+
+        depth, sink_class, sink_name, sink_signal = best
+        path = [sink_signal]
+        while path[-1] in parent:
+            path.append(parent[path[-1]])
+        path.reverse()
+        source_signal = path[0]
+        source_class = "DFF_Q" if source_signal in dff_q_signals else "PI"
+        return {
+            "scope": "global",
+            "depth": depth,
+            "source_class": source_class,
+            "source_signal": source_signal,
+            "sink_class": sink_class,
+            "sink_name": sink_name,
+            "sink_signal": sink_signal,
             "path": path,
         }
 
@@ -1254,11 +1453,23 @@ class EDAEngine:
     ) -> dict:
         """Return a compact transitive-fanin report for an output signal."""
         inline_limit = max(0, int(inline_limit))
-        gates = self.get_logic_cone(output_signal)
+        self._require_netlist()
+        self._resolve_signal(output_signal)
+        resolution = self._resolve_fanin_cone_target(output_signal)
+        resolved_output = resolution["resolved_signal"]
+        gates = self.get_logic_cone(resolved_output)
         result = {
             "output_signal": output_signal,
             "count": len(gates),
         }
+        if resolution["through_dff"] is not None:
+            result.update(
+                {
+                    "resolved_output": resolved_output,
+                    "through_dff": resolution["through_dff"],
+                    "resolved_pin": resolution["resolved_pin"],
+                }
+            )
         if len(gates) <= inline_limit:
             result["gates"] = gates
             return result
@@ -1279,6 +1490,12 @@ class EDAEngine:
                 f"# Transitive fanin gates for {output_signal} "
                 f"(count: {len(gates)})\n"
             )
+            if resolution["through_dff"] is not None:
+                report.write(
+                    f"# Registered output: {resolution['through_dff']}.Q "
+                    f"-> {resolution['through_dff']}.D\n"
+                )
+                report.write(f"# Resolved cone target: {resolved_output}\n")
             for gate_name in gates:
                 report.write(f"{gate_name}\n")
         result["file_path"] = os.path.abspath(report.name)
@@ -1300,16 +1517,19 @@ class EDAEngine:
         out2gate = self._build_output_to_gate()
         driver = out2gate.get(output_signal)
 
+        primary_input_bits: Set[str] = set()
+        for pi in nl.primary_inputs:
+            wi = nl.wires.get(pi)
+            if wi and wi.is_bus:
+                lo, hi = sorted((wi.lsb, wi.msb))
+                primary_input_bits.update(f"{pi}[{bit}]" for bit in range(lo, hi + 1))
+            else:
+                primary_input_bits.add(pi)
+        dff_q_signals = {dff.q for dff in nl.dffs.values()}
+        constants = {"1'b0", "1'b1"}
+
         def is_primary_input(sig: str) -> bool:
-            if sig in nl.primary_inputs:
-                return True
-            for pi in nl.primary_inputs:
-                wi = nl.wires.get(pi)
-                if wi and wi.is_bus:
-                    lo, hi = sorted((wi.lsb, wi.msb))
-                    if sig in [f"{pi}[{b}]" for b in range(lo, hi + 1)]:
-                        return True
-            return False
+            return sig in primary_input_bits
 
         # 1. Direct Primary Input / Length-0 connection
         if driver is None:
@@ -1318,19 +1538,28 @@ class EDAEngine:
                     "output_signal": output_signal,
                     "driver_type": "primary_input",
                     "equation": f"{output_signal} = {output_signal}",
+                    "primary_input_only_expression_available": True,
+                    "primary_inputs_used": [output_signal],
+                    "state_boundaries": [],
                     "explanation": f"Output {output_signal} is directly connected to primary input {output_signal}.",
                 }
-            if output_signal in {"1'b0", "1'b1"}:
+            if output_signal in constants:
                 return {
                     "output_signal": output_signal,
                     "driver_type": "constant",
                     "equation": f"{output_signal} = {output_signal}",
+                    "primary_input_only_expression_available": True,
+                    "primary_inputs_used": [],
+                    "state_boundaries": [],
                     "explanation": f"Signal {output_signal} is a constant tie-off ({output_signal}).",
                 }
             return {
                 "output_signal": output_signal,
                 "driver_type": "undriven",
                 "equation": f"{output_signal} is undriven / unassigned",
+                "primary_input_only_expression_available": False,
+                "primary_inputs_used": [],
+                "state_boundaries": [],
                 "explanation": f"No driver found for {output_signal}.",
             }
 
@@ -1349,9 +1578,14 @@ class EDAEngine:
                     "q": dff.q,
                 },
                 "equation": f"{output_signal} = {driver}.Q",
+                "primary_input_only_expression_available": False,
+                "expression_basis": "registered_state",
+                "primary_inputs_used": [],
+                "state_boundaries": [dff.q],
                 "explanation": (
                     f"Output {output_signal} is directly driven by register (DFF) {driver} pin Q. "
-                    f"Its data input D is driven by net {dff.d}."
+                    "Its current value is stored state and cannot be expressed solely from "
+                    f"current primary inputs. Its data input D is driven by net {dff.d}."
                 ),
             }
 
@@ -1362,6 +1596,9 @@ class EDAEngine:
                 "output_signal": output_signal,
                 "driver_type": "primary_input",
                 "equation": f"{output_signal} = {output_signal}",
+                "primary_input_only_expression_available": is_primary_input(output_signal),
+                "primary_inputs_used": [output_signal] if is_primary_input(output_signal) else [],
+                "state_boundaries": [output_signal] if output_signal in dff_q_signals else [],
                 "explanation": f"No combinational gates feed {output_signal}.",
             }
 
@@ -1369,12 +1606,15 @@ class EDAEngine:
         in_degree = {g: 0 for g in cone_gates}
         successors: Dict[str, List[str]] = {g: [] for g in cone_gates}
 
-        for g in cone_gates:
-            out_net = nl.nodes[g].output
-            for other_g in cone_gates:
-                if out_net in nl.nodes[other_g].inputs:
-                    successors[g].append(other_g)
-                    in_degree[other_g] += 1
+        cone_gate_set = set(cone_gates)
+        for consumer in cone_gates:
+            consumer_producers: Set[str] = set()
+            for input_signal in nl.nodes[consumer].inputs:
+                producer = out2gate.get(input_signal)
+                if producer in cone_gate_set and producer not in consumer_producers:
+                    consumer_producers.add(producer)
+                    successors[producer].append(consumer)
+                    in_degree[consumer] += 1
 
         queue = deque([g for g in cone_gates if in_degree[g] == 0])
         topo_order: List[str] = []
@@ -1455,6 +1695,11 @@ class EDAEngine:
             expr_map[node.output] = sub_eq
 
         final_substituted = expr_map.get(output_signal, output_signal)
+        primary_inputs_used = sorted(boundary_inputs & primary_input_bits)
+        state_boundaries = sorted(boundary_inputs & dff_q_signals)
+        unresolved_boundaries = sorted(
+            boundary_inputs - primary_input_bits - dff_q_signals - constants
+        )
 
         result: Dict[str, Any] = {
             "output_signal": output_signal,
@@ -1462,6 +1707,17 @@ class EDAEngine:
             "cone_gate_count": len(cone_gates),
             "cone_gates": cone_gates,
             "boundary_inputs": sorted(boundary_inputs),
+            "primary_inputs_used": primary_inputs_used,
+            "state_boundaries": state_boundaries,
+            "unresolved_boundaries": unresolved_boundaries,
+            "primary_input_only_expression_available": not (
+                state_boundaries or unresolved_boundaries
+            ),
+            "expression_basis": (
+                "primary_inputs"
+                if not (state_boundaries or unresolved_boundaries)
+                else "combinational_boundary_inputs"
+            ),
             "gate_breakdown": gate_breakdown[:inline_limit],
             "total_gates_in_breakdown": len(gate_breakdown),
             "equation": f"{output_signal} = {final_substituted}",
@@ -1495,6 +1751,25 @@ class EDAEngine:
         """
         return int(self.count_gate_types_in_cone(output_signal)["total"])
 
+    def _resolve_fanin_cone_target(self, signal: str) -> dict:
+        """Resolve a registered output to its D-pin next-state cone target."""
+        nl = self._netlist
+        assert nl is not None
+        for instance, dff in nl.dffs.items():
+            if dff.q == signal:
+                return {
+                    "requested_signal": signal,
+                    "resolved_signal": dff.d,
+                    "through_dff": instance,
+                    "resolved_pin": "D",
+                }
+        return {
+            "requested_signal": signal,
+            "resolved_signal": signal,
+            "through_dff": None,
+            "resolved_pin": None,
+        }
+
     def count_gate_types_in_cone(self, output_signal: str) -> dict:
         """Return total and per-type gate counts in the logic cone."""
         self._require_netlist()
@@ -1502,10 +1777,8 @@ class EDAEngine:
         nl = self._netlist
         assert nl is not None
 
-        actual_output = output_signal
-        dff_q_to_d = {dff.q: dff.d for dff in nl.dffs.values()}
-        if output_signal in dff_q_to_d:
-            actual_output = dff_q_to_d[output_signal]
+        resolution = self._resolve_fanin_cone_target(output_signal)
+        actual_output = resolution["resolved_signal"]
 
         out2gate = self._build_output_to_gate()
         pi_set = set(nl.primary_inputs)
@@ -1534,12 +1807,160 @@ class EDAEngine:
             gate_type = nl.nodes[inst].gate_type
             by_type[gate_type] = by_type.get(gate_type, 0) + 1
 
-        return {
+        result = {
             "output_signal": output_signal,
             "resolved_output": actual_output,
             "total": len(cone_insts),
             "by_type": dict(sorted(by_type.items())),
         }
+        if resolution["through_dff"] is not None:
+            result["through_dff"] = resolution["through_dff"]
+            result["resolved_pin"] = resolution["resolved_pin"]
+        return result
+
+    def rank_signals_by_fanin_cone(
+        self,
+        signal_class: str,
+        metric: str = "gate_count",
+        order: str = "descending",
+        limit: int = 1,
+        include_ties: bool = True,
+        inline_limit: int = 100,
+    ) -> dict:
+        """Rank a complete signal class by fanin-cone size or depth."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        normalized_class = signal_class.strip().upper()
+        aliases = {
+            "PRIMARY_OUTPUT": "PO",
+            "PRIMARY_OUTPUTS": "PO",
+            "DFFD": "DFF_D",
+            "DFFQ": "DFF_Q",
+            "GATE_OUTPUTS": "GATE_OUTPUT",
+        }
+        normalized_class = aliases.get(normalized_class, normalized_class)
+        if normalized_class not in {"PO", "DFF_D", "DFF_Q", "GATE_OUTPUT"}:
+            raise ValueError(
+                "signal_class must be PO, DFF_D, DFF_Q, or GATE_OUTPUT"
+            )
+        normalized_metric = metric.strip().lower()
+        if normalized_metric not in {"gate_count", "depth"}:
+            raise ValueError("metric must be 'gate_count' or 'depth'")
+        normalized_order = order.strip().lower()
+        if normalized_order not in {"ascending", "descending"}:
+            raise ValueError("order must be 'ascending' or 'descending'")
+        limit = int(limit)
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        inline_limit = max(0, int(inline_limit))
+
+        def expand_port(port_name: str) -> List[str]:
+            wire = nl.wires.get(port_name)
+            if wire and wire.is_bus:
+                lo, hi = sorted((wire.lsb, wire.msb))
+                return [f"{port_name}[{bit}]" for bit in range(lo, hi + 1)]
+            return [port_name]
+
+        populations = {
+            "PO": {
+                signal
+                for port_name in nl.primary_outputs
+                for signal in expand_port(port_name)
+            },
+            "DFF_D": {dff.d for dff in nl.dffs.values() if dff.d},
+            "DFF_Q": {dff.q for dff in nl.dffs.values() if dff.q},
+            "GATE_OUTPUT": {node.output for node in nl.nodes.values() if node.output},
+        }
+        signals = sorted(populations[normalized_class])
+        by_value: Dict[int, List[str]] = {}
+        resolutions: Dict[str, dict] = {}
+        depth_memo: Dict[str, int] = {}
+        for signal in signals:
+            resolution = (
+                self._resolve_fanin_cone_target(signal)
+                if normalized_class in {"PO", "DFF_Q"}
+                else {
+                    "requested_signal": signal,
+                    "resolved_signal": signal,
+                    "through_dff": None,
+                    "resolved_pin": None,
+                }
+            )
+            resolutions[signal] = resolution
+            if normalized_metric == "gate_count":
+                value = (
+                    int(self.count_gate_types_in_cone(signal)["total"])
+                    if normalized_class in {"PO", "DFF_Q"}
+                    else len(self.get_logic_cone(signal))
+                )
+            else:
+                value = self._fanin_depth(resolution["resolved_signal"], depth_memo)
+            by_value.setdefault(value, []).append(signal)
+
+        values = sorted(
+            by_value,
+            reverse=normalized_order == "descending",
+        )[:limit]
+        rankings = []
+        returned_signal_count = 0
+        for rank, value in enumerate(values, start=1):
+            tied = sorted(by_value[value])
+            selected = tied if include_ties else tied[:1]
+            returned_signal_count += len(selected)
+            rankings.append(
+                {
+                    "rank": rank,
+                    "value": value,
+                    normalized_metric: value,
+                    "signals": selected,
+                    "tie_count": len(tied),
+                    "resolutions": {
+                        signal: resolutions[signal]
+                        for signal in selected
+                        if resolutions[signal]["through_dff"] is not None
+                    },
+                }
+            )
+
+        result = {
+            "signal_class": normalized_class,
+            "metric": normalized_metric,
+            "registered_output_handling": "resolve_q_to_d_next_state_cone",
+            "bus_handling": "individual_bits",
+            "order": normalized_order,
+            "requested_rank_count": limit,
+            "examined_signal_count": len(signals),
+            "returned_rank_count": len(rankings),
+            "returned_signal_count": returned_signal_count,
+            "include_ties": bool(include_ties),
+        }
+        if returned_signal_count <= inline_limit:
+            result["rankings"] = rankings
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="fanin_cone_ranking_",
+            suffix=".tsv",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(f"rank\t{normalized_metric}\tsignal\tresolved_signal\n")
+            for ranking in rankings:
+                for signal in ranking["signals"]:
+                    report.write(
+                        f"{ranking['rank']}\t{ranking['value']}\t{signal}\t"
+                        f"{resolutions[signal]['resolved_signal']}\n"
+                    )
+        result["sample_rankings"] = [
+            {**ranking, "signals": ranking["signals"][:10]}
+            for ranking in rankings[:10]
+        ]
+        result["file_path"] = os.path.abspath(report.name)
+        return result
 
     def _nodes_reaching_sink(self, sink: str) -> Set[str]:
         """Return all signals that can reach sink."""
@@ -1798,6 +2219,123 @@ class EDAEngine:
             report.write(f"# Direct fanout gates for {net_name} (count: {len(fanout)})\n")
             for gate_name in fanout:
                 report.write(f"{gate_name}\n")
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
+    def rank_signals_by_fanout(
+        self,
+        signal_class: str,
+        order: str = "descending",
+        limit: int = 1,
+        include_ties: bool = True,
+        inline_limit: int = 100,
+    ) -> dict:
+        """Rank a complete class of signals by direct load-pin fanout."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        normalized_class = signal_class.strip().upper()
+        class_aliases = {
+            "PRIMARY_INPUT": "PI",
+            "PRIMARY_INPUTS": "PI",
+            "DFFQ": "DFF_Q",
+            "GATE_OUTPUTS": "GATE_OUTPUT",
+            "ALL": "ALL_DRIVEN",
+        }
+        normalized_class = class_aliases.get(normalized_class, normalized_class)
+        if normalized_class not in {"PI", "DFF_Q", "GATE_OUTPUT", "ALL_DRIVEN"}:
+            raise ValueError(
+                "signal_class must be PI, DFF_Q, GATE_OUTPUT, or ALL_DRIVEN"
+            )
+
+        normalized_order = order.strip().lower()
+        if normalized_order not in {"ascending", "descending"}:
+            raise ValueError("order must be 'ascending' or 'descending'")
+        limit = int(limit)
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        inline_limit = max(0, int(inline_limit))
+
+        def expand_port(port_name: str) -> List[str]:
+            wire = nl.wires.get(port_name)
+            if wire and wire.is_bus:
+                lo, hi = sorted((wire.lsb, wire.msb))
+                return [f"{port_name}[{bit}]" for bit in range(lo, hi + 1)]
+            return [port_name]
+
+        primary_input_bits = {
+            signal
+            for port_name in nl.primary_inputs
+            for signal in expand_port(port_name)
+        }
+        dff_q_signals = {dff.q for dff in nl.dffs.values() if dff.q}
+        gate_outputs = {node.output for node in nl.nodes.values() if node.output}
+        populations = {
+            "PI": primary_input_bits,
+            "DFF_Q": dff_q_signals,
+            "GATE_OUTPUT": gate_outputs,
+            "ALL_DRIVEN": primary_input_bits | dff_q_signals | gate_outputs,
+        }
+        signals = sorted(populations[normalized_class] - {"1'b0", "1'b1"})
+        fanout_map = self._build_fanout_map()
+
+        by_fanout: Dict[int, List[str]] = {}
+        for signal in signals:
+            by_fanout.setdefault(len(fanout_map.get(signal, [])), []).append(signal)
+        fanout_values = sorted(
+            by_fanout,
+            reverse=normalized_order == "descending",
+        )[:limit]
+
+        rankings = []
+        returned_signal_count = 0
+        for rank, fanout_value in enumerate(fanout_values, start=1):
+            tied_signals = sorted(by_fanout[fanout_value])
+            selected_signals = tied_signals if include_ties else tied_signals[:1]
+            returned_signal_count += len(selected_signals)
+            rankings.append(
+                {
+                    "rank": rank,
+                    "fanout": fanout_value,
+                    "signals": selected_signals,
+                    "tie_count": len(tied_signals),
+                }
+            )
+
+        result = {
+            "signal_class": normalized_class,
+            "fanout_definition": "direct_load_pins",
+            "bus_handling": "individual_bits",
+            "order": normalized_order,
+            "requested_rank_count": limit,
+            "examined_signal_count": len(signals),
+            "returned_rank_count": len(rankings),
+            "returned_signal_count": returned_signal_count,
+            "include_ties": bool(include_ties),
+        }
+        if returned_signal_count <= inline_limit:
+            result["rankings"] = rankings
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="fanout_ranking_",
+            suffix=".tsv",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write("rank\tfanout\tsignal\n")
+            for ranking in rankings:
+                for signal in ranking["signals"]:
+                    report.write(
+                        f"{ranking['rank']}\t{ranking['fanout']}\t{signal}\n"
+                    )
+        result["sample_rankings"] = [
+            {**ranking, "signals": ranking["signals"][:10]}
+            for ranking in rankings[:10]
+        ]
         result["file_path"] = os.path.abspath(report.name)
         return result
 
@@ -2275,6 +2813,179 @@ class EDAEngine:
                 report.write(json.dumps(item, sort_keys=True) + "\n")
         result["file_path"] = os.path.abspath(report.name)
         return result
+
+    def check_function_symmetry(
+        self,
+        output_signal: str,
+        input_a: str,
+        input_b: str,
+    ) -> dict:
+        """Prove whether an output function is symmetric in two PI bits."""
+        import textwrap
+
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        self._resolve_signal(output_signal)
+        self._resolve_signal(input_a)
+        self._resolve_signal(input_b)
+
+        def expand_port(port_name: str) -> List[str]:
+            wire = nl.wires.get(port_name)
+            if wire and wire.is_bus:
+                lo, hi = sorted((wire.lsb, wire.msb))
+                return [f"{port_name}[{bit}]" for bit in range(lo, hi + 1)]
+            return [port_name]
+
+        pi_bits = {
+            signal
+            for port_name in nl.primary_inputs
+            for signal in expand_port(port_name)
+        }
+        if input_a not in pi_bits or input_b not in pi_bits:
+            raise ValueError(
+                "Symmetry inputs must be scalar primary inputs or primary-input bits."
+            )
+        if input_a == input_b:
+            return {
+                "output_signal": output_signal,
+                "input_a": input_a,
+                "input_b": input_b,
+                "symmetric": True,
+                "proof": "identical_inputs",
+            }
+
+        comb_driver = {node.output: node for node in nl.nodes.values()}
+        cone_nodes: Dict[str, GateNode] = {}
+        boundary_signals: Set[str] = set()
+        active: Set[str] = set()
+
+        def collect(signal: str) -> None:
+            if signal in {"1'b0", "1'b1"}:
+                return
+            node = comb_driver.get(signal)
+            if node is None:
+                boundary_signals.add(signal)
+                return
+            if node.name in cone_nodes or signal in active:
+                return
+            active.add(signal)
+            cone_nodes[node.name] = node
+            for node_input in node.inputs:
+                collect(node_input)
+            active.discard(signal)
+
+        collect(output_signal)
+        depends_on = sorted({input_a, input_b} & boundary_signals)
+        if not depends_on:
+            return {
+                "output_signal": output_signal,
+                "input_a": input_a,
+                "input_b": input_b,
+                "symmetric": True,
+                "proof": "independence",
+                "dependent_symmetry_inputs": [],
+                "cone_gate_count": len(cone_nodes),
+            }
+
+        # Build two copies of the output cone. All boundary values are shared,
+        # except that input_a and input_b are exchanged in the second copy.
+        boundary_signals.update({input_a, input_b})
+        aliases = {
+            signal: f"sym_boundary_{index}"
+            for index, signal in enumerate(sorted(boundary_signals))
+        }
+        model = Netlist(module_name="symmetry_miter")
+        model.primary_inputs = list(aliases.values())
+        for alias in aliases.values():
+            model.wires[alias] = WireInfo(name=alias)
+
+        output_maps = [
+            {
+                node.output: f"sym_{copy_index}_net_{index}"
+                for index, node in enumerate(cone_nodes.values())
+            }
+            for copy_index in range(2)
+        ]
+        for output_map in output_maps:
+            for signal in output_map.values():
+                model.wires[signal] = WireInfo(name=signal)
+
+        def remap(signal: str, copy_index: int) -> str:
+            if signal in {"1'b0", "1'b1"}:
+                return signal
+            if signal in output_maps[copy_index]:
+                return output_maps[copy_index][signal]
+            if copy_index == 1 and signal == input_a:
+                return aliases[input_b]
+            if copy_index == 1 and signal == input_b:
+                return aliases[input_a]
+            return aliases[signal]
+
+        for copy_index in range(2):
+            for index, node in enumerate(cone_nodes.values()):
+                instance = f"sym_{copy_index}_gate_{index}"
+                model.nodes[instance] = GateNode(
+                    name=instance,
+                    gate_type=node.gate_type,
+                    inputs=[remap(signal, copy_index) for signal in node.inputs],
+                    output=output_maps[copy_index][node.output],
+                )
+
+        out_normal = remap(output_signal, 0)
+        out_swapped = remap(output_signal, 1)
+        diff_signal = "symmetry_diff"
+        model.wires[diff_signal] = WireInfo(name=diff_signal)
+        model.primary_outputs = [diff_signal]
+        model.nodes["symmetry_diff_gate"] = GateNode(
+            name="symmetry_diff_gate",
+            gate_type="xor",
+            inputs=[out_normal, out_swapped],
+            output=diff_signal,
+        )
+
+        tmp_dir = tempfile.mkdtemp(prefix="symmetry_", dir=_workspace_temp_dir())
+        netlist_path = os.path.join(tmp_dir, "miter.v")
+        script_path = os.path.join(tmp_dir, "prove.ys")
+        write_verilog(model, netlist_path)
+        script = textwrap.dedent(f"""\
+            read_verilog {netlist_path}
+            prep -top {model.module_name}
+            sat -set {diff_signal} 1 -max 1 -show-inputs -show {diff_signal}
+        """)
+        with open(script_path, "w") as handle:
+            handle.write(script)
+        try:
+            result = subprocess.run(
+                [_yosys_binary(), "-s", script_path],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
+            )
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            lower = combined.lower()
+            if "sat solving finished - no model found" in lower:
+                symmetric = True
+            elif "sat solving finished - model found" in lower:
+                symmetric = False
+            else:
+                raise RuntimeError(
+                    "Could not determine Yosys symmetry result:\n" + combined[-3000:]
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return {
+            "output_signal": output_signal,
+            "input_a": input_a,
+            "input_b": input_b,
+            "symmetric": symmetric,
+            "proof": "formal_sat",
+            "dependent_symmetry_inputs": depends_on,
+            "cone_gate_count": len(cone_nodes),
+        }
 
     def check_signal_equivalence(self, sig1: str, sig2: str) -> bool:
         """Check if two signals in the current netlist are functionally equivalent.
@@ -3475,9 +4186,11 @@ sat -prove {prove_signal} {prove_value} -verify
         result = {
             "count": len(matches),
             "gate_type": gate_type or "any",
-            "input_count": input_count,
-            "has_input": has_input,
         }
+        if input_count is not None:
+            result["input_count"] = input_count
+        if has_input is not None:
+            result["has_input"] = has_input
         if len(matches) <= inline_limit:
             result["matches"] = matches
             return result
@@ -3485,27 +4198,17 @@ sat -prove {prove_signal} {prove_value} -verify
         report = tempfile.NamedTemporaryFile(
             "w",
             prefix="find_gates_",
-            suffix=".txt",
+            suffix=".tsv",
             dir=_workspace_temp_dir(),
             delete=False,
         )
         with report:
-            report.write(
-                f"# find_gates count={len(matches)} "
-                f"gate_type={gate_type or 'any'} input_count={input_count} "
-                f"has_input={has_input}\n"
-            )
-            report.write("# columns: instance gate_type output inputs\n")
+            report.write("instance\tgate_type\toutput\tinputs\n")
             for match in matches:
                 report.write(
-                    "# "
-                    f"{match['instance']} {match['gate_type']} "
-                    f"{match['output']} {','.join(match['inputs'])}\n"
+                    f"{match['instance']}\t{match['gate_type']}\t"
+                    f"{match['output']}\t{','.join(match['inputs'])}\n"
                 )
-            report.write("# jsonl:\n")
-            for match in matches:
-                report.write(json.dumps(match, sort_keys=True) + "\n")
-        result["sample_matches"] = matches[:inline_limit]
         result["file_path"] = os.path.abspath(report.name)
         return result
 
@@ -3615,6 +4318,8 @@ sat -prove {prove_signal} {prove_value} -verify
             "unknown_signals": unknown_signals[:20],
             "unknown_signal_count": len(unknown_signals),
         }
+        self._last_constant_input_matches = copy.deepcopy(matches)
+        self._last_constant_input_signature = self._constant_analysis_signature()
 
         if len(matches) <= inline_limit:
             result["matches"] = matches
@@ -3650,6 +4355,150 @@ sat -prove {prove_signal} {prove_value} -verify
         result["file_path"] = os.path.abspath(report.name)
         self._last_constant_input_report = copy.deepcopy(result)
         return result
+
+    def simplify_gates_with_constant_inputs(
+        self,
+        gate_type: str,
+        functional: bool = True,
+        use_last_report: bool = True,
+    ) -> dict:
+        """Simplify gates using literal or proven functional constant inputs."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        gate_type = gate_type.strip().lower()
+        if gate_type not in PRIMITIVE_GATES:
+            raise ValueError(f"Unknown gate type: {gate_type!r}")
+
+        report = self._last_constant_input_report
+        matches = self._last_constant_input_matches
+        compatible_cache = bool(
+            use_last_report
+            and report
+            and matches is not None
+            and report.get("gate_type") == gate_type
+            and bool(report.get("functional")) == bool(functional)
+            and report.get("complete")
+            and self._last_constant_input_signature
+            == self._constant_analysis_signature()
+        )
+        analysis_reused = compatible_cache
+        if not compatible_cache:
+            report = self.find_gates_with_constant_inputs(
+                gate_type,
+                values=[0, 1],
+                functional=functional,
+                inline_limit=len(nl.nodes) + 1,
+            )
+            matches = self._last_constant_input_matches or []
+
+        assert report is not None
+        assert matches is not None
+        if not report.get("complete"):
+            raise RuntimeError(
+                "Constant-input analysis was incomplete; refusing to transform the design."
+            )
+
+        replacement_breakdown: Dict[str, int] = {}
+        replaced_instances: List[str] = []
+        stale_matches = 0
+
+        def replacement(node: GateNode, constant_inputs: List[dict]):
+            known = {
+                int(item["index"]): int(item["value"])
+                for item in constant_inputs
+            }
+            if node.gate_type in ONE_INPUT_GATES:
+                value = known.get(0)
+                if value is None:
+                    return None
+                if node.gate_type == "not":
+                    value = 1 - value
+                return "buf", [f"1'b{value}"]
+
+            if len(node.inputs) != 2:
+                return None
+            if 0 in known and 1 in known:
+                a, b = known[0], known[1]
+                values = {
+                    "and": a & b,
+                    "or": a | b,
+                    "nand": 1 - (a & b),
+                    "nor": 1 - (a | b),
+                    "xor": a ^ b,
+                    "xnor": 1 - (a ^ b),
+                }
+                return "buf", [f"1'b{values[node.gate_type]}"]
+
+            constant_index = next(iter(known), None)
+            if constant_index is None:
+                return None
+            value = known[constant_index]
+            other = node.inputs[1 - constant_index]
+            rules = {
+                "and": ("buf", ["1'b0"]) if value == 0 else ("buf", [other]),
+                "or": ("buf", ["1'b1"]) if value == 1 else ("buf", [other]),
+                "nand": ("buf", ["1'b1"]) if value == 0 else ("not", [other]),
+                "nor": ("buf", ["1'b0"]) if value == 1 else ("not", [other]),
+                "xor": ("buf", [other]) if value == 0 else ("not", [other]),
+                "xnor": ("not", [other]) if value == 0 else ("buf", [other]),
+            }
+            return rules.get(node.gate_type)
+
+        for match in matches:
+            instance = match["instance"]
+            node = nl.nodes.get(instance)
+            if (
+                node is None
+                or node.gate_type != match.get("gate_type")
+                or list(node.inputs) != list(match.get("inputs", []))
+            ):
+                stale_matches += 1
+                continue
+            change = replacement(node, match.get("constant_inputs", []))
+            if change is None:
+                continue
+            new_type, new_inputs = change
+            self.replace_gate(instance, new_type, new_inputs=new_inputs)
+            replaced_instances.append(instance)
+            replacement_breakdown[new_type.upper()] = (
+                replacement_breakdown.get(new_type.upper(), 0) + 1
+            )
+
+        if replaced_instances:
+            self._last_constant_input_report = None
+            self._last_constant_input_matches = None
+            self._last_constant_input_signature = None
+
+        return {
+            "gate_type": gate_type,
+            "functional": bool(functional),
+            "analysis_reused": analysis_reused,
+            "reported_gates": len(matches),
+            "simplified_gates": len(replaced_instances),
+            "eliminated_original_gate_type": len(replaced_instances),
+            "replacement_breakdown": dict(sorted(replacement_breakdown.items())),
+            "stale_matches_skipped": stale_matches,
+            "instances": replaced_instances[:50],
+        }
+
+    def _constant_analysis_signature(self) -> tuple:
+        """Return a deterministic structural signature for cache validation."""
+        nl = self._netlist
+        assert nl is not None
+        gates = tuple(
+            sorted(
+                (name, node.gate_type, node.output, tuple(node.inputs))
+                for name, node in nl.nodes.items()
+            )
+        )
+        dffs = tuple(
+            sorted(
+                (name, dff.ck, dff.rn, dff.sn, dff.d, dff.q)
+                for name, dff in nl.dffs.items()
+            )
+        )
+        return gates, dffs, tuple(nl.primary_inputs), tuple(nl.primary_outputs)
 
     def _normalize_constant_values(self, values: List[object]) -> Set[int]:
         normalized: Set[int] = set()
@@ -4326,60 +5175,55 @@ sat -prove {prove_signal} {prove_value} -verify
         """
         self._require_netlist()
         self._resolve_signal(net_name)
-        if max_fanout < 1:
-            raise ValueError("max_fanout must be >= 1")
+        if max_fanout < 2:
+            raise ValueError(
+                "max_fanout must be >= 2; buffers cannot reduce fanout to 1"
+            )
 
         nl = self._netlist
         assert nl is not None
 
+        def load_pins(signal: str):
+            """Return mutable references to each individual load pin."""
+            pins = []
+            for inst_name, node in nl.nodes.items():
+                for input_index, input_signal in enumerate(node.inputs):
+                    if input_signal == signal:
+                        pins.append(("gate", inst_name, input_index))
+            for inst_name, dff in nl.dffs.items():
+                for attr_name in ("ck", "rn", "sn", "d"):
+                    if getattr(dff, attr_name) == signal:
+                        pins.append(("dff", inst_name, attr_name))
+            return pins
+
         total_inserted = 0
-        # Build list of nets that still need splitting
-        nets_to_process = [net_name]
+        while True:
+            pins = load_pins(net_name)
+            if len(pins) <= max_fanout:
+                break
 
-        while nets_to_process:
-            cur_net = nets_to_process.pop()
-            fanout_list = self._build_fanout_map().get(cur_net, [])
-            if len(fanout_list) <= max_fanout:
-                continue
+            # Replacing F load pins with one buffer input reduces the source
+            # fanout by F-1. Repeating this constructs a minimum-size tree;
+            # once source-level buffers themselves are grouped, it naturally
+            # becomes multilevel.
+            group = pins[:max_fanout]
+            new_wire = self._next_wire_name("fo_w")
+            buf_inst = self._next_inst_name("fo_buf")
+            self._add_wire(new_wire)
 
-            # Split into groups of max_fanout
-            groups = [
-                fanout_list[i : i + max_fanout]
-                for i in range(0, len(fanout_list), max_fanout)
-            ]
+            for load_kind, inst_name, pin in group:
+                if load_kind == "gate":
+                    nl.nodes[inst_name].inputs[pin] = new_wire
+                else:
+                    setattr(nl.dffs[inst_name], pin, new_wire)
 
-            for grp in groups[1:]:  # first group keeps original net
-                new_wire = self._next_wire_name("fo_w")
-                buf_inst = self._next_inst_name("fo_buf")
-                self._add_wire(new_wire)
-                buf_node = GateNode(
-                    name=buf_inst,
-                    gate_type="buf",
-                    inputs=[cur_net],
-                    output=new_wire,
-                )
-                nl.nodes[buf_inst] = buf_node
-                total_inserted += 1
-
-                # Reconnect group's consumers to new_wire
-                for consumer_inst in grp:
-                    if consumer_inst in nl.nodes:
-                        node = nl.nodes[consumer_inst]
-                        node.inputs = [
-                            new_wire if s == cur_net else s for s in node.inputs
-                        ]
-                    elif consumer_inst in nl.dffs:
-                        dff = nl.dffs[consumer_inst]
-                        if dff.d == cur_net:
-                            dff.d = new_wire
-                        if dff.ck == cur_net:
-                            dff.ck = new_wire
-                        if dff.rn == cur_net:
-                            dff.rn = new_wire
-                        if dff.sn == cur_net:
-                            dff.sn = new_wire
-                # New buffer net may still have high fanout — queue it
-                nets_to_process.append(new_wire)
+            nl.nodes[buf_inst] = GateNode(
+                name=buf_inst,
+                gate_type="buf",
+                inputs=[net_name],
+                output=new_wire,
+            )
+            total_inserted += 1
 
         return total_inserted
 
