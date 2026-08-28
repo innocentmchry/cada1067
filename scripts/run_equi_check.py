@@ -245,66 +245,29 @@ def run_equiv_check(test_name: str, gold_file: Path, gate_file: Path, log_dir: P
     log_path = log_dir / f"{test_name}_equiv.log"
 
     try:
-        gold_nl = parse_verilog(str(gold_file))
+        from src.eda_engine import EDAEngine
+        eng = EDAEngine()
         gate_nl = parse_verilog(str(gate_file))
+        eng._netlist = gate_nl
+        eng._original_netlist_path = str(gold_file)
+        res = eng.check_design_equivalence()
+        
+        # Read engine log if produced
+        engine_log = ""
+        if res.get("log_path") and os.path.exists(res["log_path"]):
+            with open(res["log_path"], "r") as fh:
+                engine_log = fh.read()
+        
+        status = res.get("status", "FAIL")
+        msg = f"Status: {status}, Tier: {res.get('tier', 'Unknown')}"
+        if res.get("reason"):
+            msg += f", Reason: {res.get('reason')}"
+            
+        log_path.write_text(f"{msg}\n\n---- Engine Log ----\n{engine_log}")
+        return EquivResult(test_name, status, msg, log_path)
     except Exception as exc:
-        log_path.write_text(f"Could not parse netlist(s): {exc}\n")
-        return EquivResult(test_name, "SKIPPED", f"Could not parse netlist(s): {exc}", log_path)
-
-    mismatch = compare_dff_boundary_shapes(gold_nl, gate_nl)
-    if mismatch:
-        log_path.write_text(mismatch + "\n")
-        return EquivResult(test_name, "FAIL", mismatch, log_path)
-    if netlists_structurally_equal(gold_nl, gate_nl):
-        log_path.write_text(
-            "PASS: current design is equivalent to the original netlist "
-            "under combinational DFF-boundary equivalence.\n"
-        )
-        return EquivResult(test_name, "PASS", "Equivalence proven", log_path)
-
-    temp_root = Path(workspace_temp_env()["TMPDIR"])
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f"{test_name}_comb_equiv_", dir=temp_root))
-    comb_gold_file = tmp_dir / "gold_comb.v"
-    comb_gate_file = tmp_dir / "gate_comb.v"
-
-    write_verilog(make_dff_boundary_comb_netlist(gold_nl, "gold_comb"), str(comb_gold_file))
-    write_verilog(make_dff_boundary_comb_netlist(gate_nl, "gate_comb"), str(comb_gate_file))
-
-    script = build_yosys_script(comb_gold_file, comb_gate_file)
-    temp_env = workspace_temp_env()
-
-    try:
-        # Note: no "-q" here. With -q, Yosys suppresses normal log() output
-        # (including the "Equivalence successfully proven!" message from
-        # equiv_status), which made text-based PASS detection unreliable.
-        # We rely on the process exit code instead: equiv_status -assert
-        # causes Yosys to exit non-zero if any $equiv cell is unproven.
-        proc = subprocess.run(
-            [yosys_binary(), "-p", script],
-            capture_output=True, text=True, timeout=timeout,
-            env=temp_env,
-            cwd=temp_env["TMPDIR"],
-        )
-    except subprocess.TimeoutExpired:
-        log_path.write_text(f"TIMEOUT after {timeout}s\nScript:\n{script}\n")
-        return EquivResult(test_name, "ERROR", f"Timed out after {timeout}s", log_path)
-    except FileNotFoundError:
-        sys.exit("yosys executable not found. Is Yosys installed and on PATH?")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    output = proc.stdout + "\n" + proc.stderr
-    log_path.write_text(f"Yosys script:\n{script}\n\n---- Output ----\n{output}")
-
-    if proc.returncode == 0:
-        return EquivResult(test_name, "PASS", "Equivalence proven", log_path)
-
-    reason = "Equivalence check failed or assertion error"
-    for line in output.splitlines():
-        if "ERROR" in line or "Failed" in line or "failed" in line:
-            reason = line.strip()
-            break
-    return EquivResult(test_name, "FAIL", reason, log_path)
+        log_path.write_text(f"Equivalence checking exception: {exc}\n")
+        return EquivResult(test_name, "ERROR", str(exc), log_path)
 
 
 # def discover_pairs(input_dir: Path, output_dir: Path):
