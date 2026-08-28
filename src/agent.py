@@ -960,10 +960,21 @@ class EDAAgent:
             return f"remap_design_with_gates: FAILED — {data.get('reason', 'unknown error')}"
         elif tool_name == "fraig_merge_equivalent_gates":
             if data.get("success", False):
+                comb_before = data.get("combinational_gates_before", data.get("gates_before", "?"))
+                comb_after = data.get("combinational_gates_after", data.get("gates_after", "?"))
+                total_before = data.get("total_gates_before")
+                total_after = data.get("total_gates_after")
+                dff_count = data.get("dff_count")
+                total_detail = ""
+                if total_before is not None and total_after is not None:
+                    total_detail = (
+                        f"; {total_before}→{total_after} total gates"
+                        + (f" including {dff_count} unchanged DFFs" if dff_count is not None else "")
+                    )
                 return (
                     f"fraig_merge_equivalent_gates: "
-                    f"{data.get('gates_before', '?')} gates → {data.get('gates_after', '?')} gates "
-                    f"(reduction {data.get('gate_reduction', '?')})"
+                    f"{comb_before} combinational gates → {comb_after} combinational gates "
+                    f"(reduction {data.get('gate_reduction', '?')}{total_detail})"
                 )
             return f"fraig_merge_equivalent_gates: FAILED"
         elif tool_name == "check_signal_equivalence":

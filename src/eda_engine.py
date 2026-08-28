@@ -71,6 +71,25 @@ def _yosys_binary() -> str:
     )
 
 
+def _abc_binary() -> str:
+    """Resolve standalone ABC from ABC_BIN or PATH."""
+    configured = os.environ.get("ABC_BIN", "").strip()
+    if configured:
+        resolved = shutil.which(os.path.expanduser(configured))
+        if resolved:
+            return resolved
+        raise RuntimeError(
+            f"ABC_BIN does not point to an executable ABC binary: {configured!r}"
+        )
+    for candidate in ("yosys-abc", "abc"):
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    raise RuntimeError(
+        "ABC executable not found. Set ABC_BIN or add yosys-abc/abc to PATH."
+    )
+
+
 def _parse_blif_template(blif_path: str, target_types: List[str], strip_buf: bool) -> Optional[dict]:
     """Parse ABC BLIF output into a gate template dict.
 
@@ -4150,6 +4169,78 @@ sat -prove {prove_signal} {prove_value} -verify
         write_verilog(gold_comb, gold_path)
         write_verilog(gate_comb, gate_path)
 
+        # Use ABC's dedicated two-network combinational equivalence checker as
+        # the primary backend.  Both complete DFF-boundary netlists are passed
+        # to CEC; no output or cone is omitted.  Yosys miter+SAT below remains
+        # a conservative fallback for startup, parser, or unrecognized-result
+        # failures from the standalone ABC executable.
+        abc_command = f"cec -T 260 -p {gold_path} {gate_path}"
+        try:
+            abc_result = subprocess.run(
+                [_abc_binary(), "-c", abc_command],
+                capture_output=True,
+                text=True,
+                timeout=270,
+                env=_temp_subprocess_env(),
+                cwd=_workspace_temp_dir(),
+            )
+            abc_output = (abc_result.stdout or "") + "\n" + (abc_result.stderr or "")
+            with open(log_path, "w") as fh:
+                fh.write("ABC executable: " + _abc_binary() + "\n")
+                fh.write("ABC command:\n" + abc_command + "\n\nABC output:\n")
+                fh.write(abc_output)
+            abc_lower = abc_output.lower()
+            if "networks are not equivalent" in abc_lower:
+                return {
+                    "equivalent": False,
+                    "status": "FAIL",
+                    "mode": "comb_dff_boundary",
+                    "backend": "standalone_abc_cec",
+                    "executable": _abc_binary(),
+                    "original_netlist": original_path,
+                    "log_path": log_path,
+                }
+            if (
+                "networks are equivalent" in abc_lower
+                and "not equivalent" not in abc_lower
+            ):
+                return {
+                    "equivalent": True,
+                    "status": "PASS",
+                    "mode": "comb_dff_boundary",
+                    "backend": "standalone_abc_cec",
+                    "executable": _abc_binary(),
+                    "original_netlist": original_path,
+                    "log_path": log_path,
+                }
+            if "timeout" in abc_lower or "timed out" in abc_lower:
+                return {
+                    "equivalent": False,
+                    "status": "TIMEOUT",
+                    "mode": "comb_dff_boundary",
+                    "backend": "standalone_abc_cec",
+                    "executable": _abc_binary(),
+                    "original_netlist": original_path,
+                    "log_path": log_path,
+                }
+        except subprocess.TimeoutExpired as exc:
+            with open(log_path, "w") as fh:
+                fh.write("ABC CEC timed out after 270 seconds.\n")
+                if exc.stdout:
+                    fh.write(str(exc.stdout))
+                if exc.stderr:
+                    fh.write(str(exc.stderr))
+            return {
+                "equivalent": False,
+                "status": "TIMEOUT",
+                "mode": "comb_dff_boundary",
+                "backend": "standalone_abc_cec",
+                "original_netlist": original_path,
+                "log_path": log_path,
+            }
+        except (OSError, RuntimeError):
+            pass
+
         script = textwrap.dedent(f"""\
             read_verilog -sv {gold_path}
             hierarchy -top gold_comb
@@ -4169,61 +4260,78 @@ sat -prove {prove_signal} {prove_value} -verify
 
             design -copy-from gold -as gold gold
             design -copy-from gate -as gate gate
-            equiv_make gold gate equiv
-            hierarchy -top equiv
-            clean -purge
-            equiv_struct
-            equiv_simple
-            equiv_status -assert
+            miter -equiv -flatten gold gate miter
+            hierarchy -top miter
+            opt_clean -purge
+            techmap
+            opt -fast
+            abc -g aig
+            opt_clean -purge
+            sat -prove trigger 0 -verify -show trigger
         """)
         with open(script_path, "w") as fh:
             fh.write(script)
 
         try:
+            process_tmp = tempfile.mkdtemp(prefix="design_equiv_process_")
+            process_env = _temp_subprocess_env()
+            process_env.update({
+                "TMPDIR": process_tmp,
+                "TEMP": process_tmp,
+                "TMP": process_tmp,
+            })
             try:
-                result = subprocess.run(
-                    [_yosys_binary(), "-s", script_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    env=_temp_subprocess_env(),
+                process = subprocess.Popen(
+                    [_yosys_binary(), "-q", "-l", log_path, "-s", script_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    env=process_env,
                     cwd=_workspace_temp_dir(),
                 )
-            except subprocess.TimeoutExpired as exc:
-                with open(log_path, "w") as fh:
+                returncode = process.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                with open(log_path, "a") as fh:
+                    fh.write("\nYosys combinational boundary equivalence timed out after 300 seconds.\n")
                     fh.write(script)
-                    fh.write("\n\nYosys combinational boundary equivalence timed out after 300 seconds.\n")
-                    if exc.stdout:
-                        fh.write(str(exc.stdout))
-                    if exc.stderr:
-                        fh.write(str(exc.stderr))
                 return {
                     "equivalent": False,
                     "status": "TIMEOUT",
                     "mode": "comb_dff_boundary",
+                    "backend": "yosys_miter_abc_sat",
                     "original_netlist": original_path,
                     "log_path": log_path,
                 }
 
-            combined = (result.stdout or "") + "\n" + (result.stderr or "")
-            with open(log_path, "w") as fh:
-                fh.write("Yosys script:\n")
-                fh.write(script)
-                fh.write("\nYosys output:\n")
-                fh.write(combined)
+            try:
+                with open(log_path) as fh:
+                    combined = fh.read()
+            except OSError:
+                combined = ""
 
-            equivalent = result.returncode == 0
+            lower = combined.lower()
+            equivalent = returncode == 0 and (
+                "sat proof finished - no model found" in lower
+            )
             status = "PASS" if equivalent else (
-                "FAIL" if "unproven $equiv" in combined.lower() else "ERROR"
+                "FAIL" if "proof did fail" in lower else "ERROR"
             )
             return {
                 "equivalent": equivalent,
                 "status": status,
                 "mode": "comb_dff_boundary",
+                "backend": "yosys_miter_abc_sat",
                 "original_netlist": original_path,
                 "log_path": log_path,
             }
         finally:
+            if "process_tmp" in locals():
+                shutil.rmtree(process_tmp, ignore_errors=True)
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _compare_dff_boundary_shapes(self, gold: Netlist, gate: Netlist) -> Optional[str]:
@@ -6978,6 +7086,7 @@ sat -prove {prove_signal} {prove_value} -verify
         original_dffs = copy.deepcopy(nl.dffs)
         original_wires = copy.deepcopy(nl.wires)
         gates_before = len(nl.nodes)
+        dff_count = len(nl.dffs)
 
         valid = ["and", "nand", "or", "nor", "xor", "xnor", "not", "buf"]
         target_gates = self._allowed_gates_constraint or valid
@@ -7075,9 +7184,16 @@ sat -prove {prove_signal} {prove_value} -verify
             gates_after = len(self._netlist.nodes)
             return {
                 "success": True,
+                # Retain the original fields for compatibility. These count
+                # combinational gates because FRAIG does not transform DFFs.
                 "gates_before": gates_before,
                 "gates_after": gates_after,
                 "gate_reduction": gates_before - gates_after,
+                "combinational_gates_before": gates_before,
+                "combinational_gates_after": gates_after,
+                "dff_count": dff_count,
+                "total_gates_before": gates_before + dff_count,
+                "total_gates_after": gates_after + dff_count,
                 "dff_boundary_buffers_inserted": boundary_buffers,
                 "helper_buffers_lowered": helpers_lowered,
                 "allowed_gates": self._allowed_gates_constraint,

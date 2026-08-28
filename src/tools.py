@@ -1381,9 +1381,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "loaded by read_design. Invoke this exact non-mutating tool for requests such as "
                 "'prove the transformed design is equivalent to the pre-transformation netlist' "
                 "or 'verify whole-design equivalence'. It serializes the current netlist and runs "
-                "Yosys combinational equivalence at DFF boundaries, treating DFF Q pins as "
+                "standalone ABC CEC on the full networks at DFF boundaries, treating DFF Q pins as "
                 "unconstrained inputs and comparing primary outputs plus DFF D/control pins. "
-                "Never call FRAIG for a proof request."
+                "A Yosys miter with internal ABC simplification and SAT is retained as a conservative "
+                "fallback for ABC startup/parser errors. Never call FRAIG as a standalone substitute for a proof request."
             ),
             "parameters": {
                 "type": "object",
