@@ -49,6 +49,14 @@ def _temp_subprocess_env() -> Dict[str, str]:
     root = _workspace_temp_dir()
     env = os.environ.copy()
     env.update({"TMPDIR": root, "TEMP": root, "TMP": root})
+    configured = os.environ.get("YOSYS_BIN", "").strip()
+    if configured:
+        bin_dir = os.path.dirname(os.path.abspath(configured))
+        lib_dir = os.path.abspath(os.path.join(bin_dir, "..", "lib"))
+        extra_paths = [bin_dir]
+        if os.path.isdir(lib_dir):
+            extra_paths.append(lib_dir)
+        env["PATH"] = os.pathsep.join(extra_paths) + os.pathsep + env.get("PATH", "")
     return env
 
 
@@ -182,8 +190,22 @@ class EDAEngine:
 
     def load(self, filepath: str) -> Netlist:
         """Load a Verilog file into the engine and return the Netlist."""
-        self._netlist = parse_verilog(filepath)
-        self._original_netlist_path = os.path.abspath(filepath)
+        resolved_path = filepath
+        if not os.path.exists(resolved_path):
+            candidates = [
+                filepath,
+                os.path.join(os.getcwd(), filepath),
+                filepath.replace("testcase/", "testcases/").replace("testcase\\", "testcases\\"),
+                filepath.replace("testcases/", "testcase/").replace("testcases\\", "testcase\\"),
+                os.path.join(os.getcwd(), filepath.replace("testcase/", "testcases/").replace("testcase\\", "testcases\\")),
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    resolved_path = cand
+                    break
+
+        self._netlist = parse_verilog(resolved_path)
+        self._original_netlist_path = os.path.abspath(resolved_path)
         self._allowed_gates_constraint = None
         return self._netlist
 
@@ -2937,24 +2959,46 @@ sat -prove {prove_signal} {prove_value} -verify
         dff_q = {dff.q for dff in nl.dffs.values() if dff.q}
         pi = set(nl.primary_inputs)
 
+        # Build cone gate list using iterative DFS post-order traversal.
+        # This guarantees correct topological order (all drivers evaluated before
+        # their consumers) even for reconvergent fanin DAGs.  BFS+reversal is NOT
+        # a valid topological sort for multi-level reconvergent fanin and can
+        # cause a gate to be evaluated before its inputs are in env[].
+        # We use an explicit stack to avoid Python recursion-limit issues on
+        # large gate cones (tens of thousands of nodes).
+        cone_leaves_set = set(unified_leaves)
+        stop_set = pi | dff_q | {"1'b0", "1'b1"} | cone_leaves_set
         cone_gates: List[str] = []
-        q = deque([root_sig])
-        vis = set([root_sig])
+        dfs_vis: Set[str] = set()          # signals whose sub-DAG has been fully processed
+        dfs_entered: Set[str] = set()      # signals currently on the stack (entered but not done)
 
-        while q:
-            s = q.popleft()
-            if s in pi or s in dff_q or s in ("1'b0", "1'b1") or s in unified_leaves:
+        # Stack items: (signal, done_flag).
+        # When done_flag is False we are entering the signal for the first time.
+        # When done_flag is True we are returning from all children → emit the gate.
+        dfs_stack: List[Tuple[str, bool]] = [(root_sig, False)]
+        while dfs_stack:
+            sig, done = dfs_stack.pop()
+            if sig in dfs_vis or sig in stop_set:
                 continue
-            gname = out2g.get(s)
-            if gname and gname in nl.nodes:
-                cone_gates.append(gname)
-                for inp in nl.nodes[gname].inputs:
-                    if inp not in vis:
-                        vis.add(inp)
-                        q.append(inp)
-
-        # Reverse topological order (inputs -> output)
-        cone_gates = cone_gates[::-1]
+            if done:
+                # All children processed; emit this gate in post-order.
+                gname = out2g.get(sig)
+                if gname and gname in nl.nodes:
+                    cone_gates.append(gname)
+                dfs_vis.add(sig)
+            else:
+                if sig in dfs_entered:
+                    # Already being processed (cycle guard — shouldn't occur in a DAG).
+                    continue
+                dfs_entered.add(sig)
+                # Schedule the "done" visit for this signal.
+                dfs_stack.append((sig, True))
+                # Then push children so they are processed first.
+                gname = out2g.get(sig)
+                if gname and gname in nl.nodes:
+                    for inp in nl.nodes[gname].inputs:
+                        if inp not in dfs_vis and inp not in stop_set:
+                            dfs_stack.append((inp, False))
 
         num_vectors = 1 << num_inputs
         num_chunks = (num_vectors + 63) // 64
@@ -3064,27 +3108,35 @@ sat -prove {prove_signal} {prove_value} -verify
         gt_gates, gt_leaves = get_tfi(gate_nl, gt_sig)
         all_leaves = sorted(g_leaves | gt_leaves)
 
+        def sanitize(name: str) -> str:
+            if name in ("1'b0", "1'b1"):
+                return name
+            return name.replace("[", "_").replace("]", "_").replace("$", "_")
+
+        san_leaves = [f"leaf_{i}" for i in range(len(all_leaves))]
+        leaf_map = {orig: san for orig, san in zip(all_leaves, san_leaves)}
+
         miter = Netlist(module_name="miter")
-        miter.primary_inputs = list(all_leaves)
-        for inp in all_leaves:
+        miter.primary_inputs = list(san_leaves)
+        for inp in san_leaves:
             miter.wires[inp] = WireInfo(name=inp)
 
         for gname in g_gates:
             node = gold_nl.nodes[gname]
-            inps = [f"gold_{inp}" if inp not in all_leaves and inp not in ("1'b0", "1'b1") else inp for inp in node.inputs]
-            out = f"gold_{node.output}" if node.output not in all_leaves else node.output
-            miter.nodes[f"gold_{gname}"] = GateNode(name=f"gold_{gname}", gate_type=node.gate_type, inputs=inps, output=out)
+            inps = [leaf_map.get(inp, f"gold_{sanitize(inp)}") for inp in node.inputs]
+            out = leaf_map.get(node.output, f"gold_{sanitize(node.output)}")
+            miter.nodes[f"gold_{sanitize(gname)}"] = GateNode(name=f"gold_{sanitize(gname)}", gate_type=node.gate_type, inputs=inps, output=out)
             miter.wires[out] = WireInfo(name=out)
 
         for gname in gt_gates:
             node = gate_nl.nodes[gname]
-            inps = [f"gate_{inp}" if inp not in all_leaves and inp not in ("1'b0", "1'b1") else inp for inp in node.inputs]
-            out = f"gate_{node.output}" if node.output not in all_leaves else node.output
-            miter.nodes[f"gate_{gname}"] = GateNode(name=f"gate_{gname}", gate_type=node.gate_type, inputs=inps, output=out)
+            inps = [leaf_map.get(inp, f"gate_{sanitize(inp)}") for inp in node.inputs]
+            out = leaf_map.get(node.output, f"gate_{sanitize(node.output)}")
+            miter.nodes[f"gate_{sanitize(gname)}"] = GateNode(name=f"gate_{sanitize(gname)}", gate_type=node.gate_type, inputs=inps, output=out)
             miter.wires[out] = WireInfo(name=out)
 
-        gold_final = f"gold_{g_sig}" if g_sig not in all_leaves else g_sig
-        gate_final = f"gate_{gt_sig}" if gt_sig not in all_leaves else gt_sig
+        gold_final = leaf_map.get(g_sig, f"gold_{sanitize(g_sig)}")
+        gate_final = leaf_map.get(gt_sig, f"gate_{sanitize(gt_sig)}")
 
         miter_out = "_miter_diff"
         miter.primary_outputs = [miter_out]
@@ -3168,11 +3220,11 @@ sat -prove {prove_signal} {prove_value} -verify
             for pin in ("d", "ck", "rn", "sn"):
                 g_sig = getattr(gold_dff, pin) or "1'b1"
                 gt_sig = getattr(gate_dff, pin) or "1'b1"
-                if resolve_gold(g_sig) != resolve_gold(gt_sig):
+                if resolve_gold(g_sig) != gt_sig:
                     unproven_endpoints.append((f"{dname}.{pin}", g_sig, gt_sig))
 
         for po in gold.primary_outputs:
-            if resolve_gold(po) != resolve_gold(po):
+            if resolve_gold(po) not in gate.primary_outputs:
                 unproven_endpoints.append((f"PO_{po}", po, po))
 
         if not unproven_gates and not unproven_endpoints:
@@ -3327,16 +3379,24 @@ sat -prove {prove_signal} {prove_value} -verify
                     affected_by_unproven.add(nxt)
                     q.append(nxt)
 
+        _trivially_equal_signals = {"1'b0", "1'b1"} | set(original_nl.primary_inputs)
+
         unresolved_endpoints: List[Tuple[str, str, str]] = []
         for po in original_nl.primary_outputs:
             if po in affected_by_unproven:
-                unresolved_endpoints.append((f"PO_{po}", po, po))
+                # Skip if both netlists drive this PO with the same trivially-provable signal
+                if po not in _trivially_equal_signals:
+                    unresolved_endpoints.append((f"PO_{po}", po, po))
 
         for dname, gold_dff in original_nl.dffs.items():
             gate_dff = nl.dffs[dname]
             for pin in ("d", "ck", "rn", "sn"):
                 g_sig = getattr(gold_dff, pin) or "1'b1"
                 gt_sig = getattr(gate_dff, pin) or "1'b1"
+                # Quick skip: if both sides carry the same trivially-provable signal
+                # (a constant or a raw primary input), no TT/SAT check is needed.
+                if g_sig == gt_sig and g_sig in _trivially_equal_signals:
+                    continue
                 if g_sig != gt_sig or g_sig in affected_by_unproven or gt_sig in affected_by_unproven:
                     unresolved_endpoints.append((f"{dname}.{pin}", g_sig, gt_sig))
 
@@ -3392,11 +3452,14 @@ sat -prove {prove_signal} {prove_value} -verify
                             f"prep -top miter\n"
                             f"sat -prove {miter_out} 1'b0 -verify\n"
                         )
+                    # Scale timeout with cone size: at least 30 s, +2 s per input
+                    # beyond 16, capped at 300 s to avoid indefinite hangs.
+                    _sat_timeout = min(300, max(30, 30 + 2 * (len(unified_leaves) - 16)))
                     res = subprocess.run(
                         [yosys_exec, "-s", ys_path],
                         capture_output=True,
                         text=True,
-                        timeout=30,
+                        timeout=_sat_timeout,
                         env=_temp_subprocess_env(),
                         cwd=_workspace_temp_dir(),
                     )

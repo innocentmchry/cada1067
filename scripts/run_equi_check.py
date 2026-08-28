@@ -22,6 +22,14 @@ def workspace_temp_env() -> dict:
     temp_root.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update({"TMPDIR": str(temp_root), "TEMP": str(temp_root), "TMP": str(temp_root)})
+    configured = os.environ.get("YOSYS_BIN", "").strip()
+    if configured:
+        bin_dir = os.path.dirname(os.path.abspath(configured))
+        lib_dir = os.path.abspath(os.path.join(bin_dir, "..", "lib"))
+        extra_paths = [bin_dir]
+        if os.path.isdir(lib_dir):
+            extra_paths.append(lib_dir)
+        env["PATH"] = os.pathsep.join(extra_paths) + os.pathsep + env.get("PATH", "")
     return env
 
 
