@@ -1501,6 +1501,65 @@ class EDAEngine:
         result["file_path"] = os.path.abspath(report.name)
         return result
 
+    def find_shared_fanin_gates(
+        self,
+        signal_a: str,
+        signal_b: str,
+        inline_limit: int = 20,
+    ) -> dict:
+        """Return the intersection of two resolved transitive fanin cones."""
+        self._require_netlist()
+        self._resolve_signal(signal_a)
+        self._resolve_signal(signal_b)
+        inline_limit = max(0, int(inline_limit))
+
+        resolution_a = self._resolve_fanin_cone_target(signal_a)
+        resolution_b = self._resolve_fanin_cone_target(signal_b)
+        cone_a = set(self.get_logic_cone(resolution_a["resolved_signal"]))
+        cone_b = set(self.get_logic_cone(resolution_b["resolved_signal"]))
+        shared = sorted(cone_a & cone_b)
+
+        def compact_resolution(resolution: dict) -> dict:
+            return {
+                "requested_signal": resolution["requested_signal"],
+                "resolved_signal": resolution["resolved_signal"],
+                "through_dff": resolution["through_dff"],
+                "resolved_pin": resolution["resolved_pin"],
+            }
+
+        result = {
+            "signal_a": signal_a,
+            "signal_b": signal_b,
+            "cone_a_count": len(cone_a),
+            "cone_b_count": len(cone_b),
+            "shared_count": len(shared),
+            "resolution_a": compact_resolution(resolution_a),
+            "resolution_b": compact_resolution(resolution_b),
+        }
+        if len(shared) <= inline_limit:
+            result["shared_gates"] = shared
+            return result
+
+        safe_a = re.sub(r"[^A-Za-z0-9_.-]+", "_", signal_a).strip("_") or "signal_a"
+        safe_b = re.sub(r"[^A-Za-z0-9_.-]+", "_", signal_b).strip("_") or "signal_b"
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix=f"shared_fanin_{safe_a}_{safe_b}_",
+            suffix=".txt",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            report.write(
+                f"# Gates shared by fanin cones of {signal_a} and {signal_b} "
+                f"(count: {len(shared)})\n"
+            )
+            for gate_name in shared:
+                report.write(f"{gate_name}\n")
+        result["sample_shared_gates"] = shared[: min(10, inline_limit)]
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
     def derive_boolean_equation(
         self, output_signal: str, inline_limit: int = 20
     ) -> dict:
@@ -2811,6 +2870,217 @@ class EDAEngine:
             report.write("# jsonl:\n")
             for item in matches:
                 report.write(json.dumps(item, sort_keys=True) + "\n")
+        result["file_path"] = os.path.abspath(report.name)
+        return result
+
+    def analyze_dff_d_input_structures(
+        self,
+        structure_types: Optional[List[str]] = None,
+        inline_limit: int = 20,
+    ) -> dict:
+        """Find structural DFF hold/enable candidates in their D-input logic.
+
+        A match requires either an identity feedback path from the DFF's own Q
+        to D, or a Q-dependent branch merging with a Q-independent branch.
+        This deliberately excludes pure toggle/arithmetic feedback that has no
+        such selection or gating merge.
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+        requested = {
+            item.strip().lower()
+            for item in (structure_types or ["enable", "hold"])
+        }
+        if not requested or not requested <= {"enable", "hold", "self_feedback"}:
+            raise ValueError(
+                "structure_types may contain enable, hold, and self_feedback"
+            )
+        inline_limit = max(0, int(inline_limit))
+
+        drivers = {node.output: node for node in nl.nodes.values()}
+        dff_qs = {dff.q for dff in nl.dffs.values() if dff.q}
+        matches: List[dict] = []
+        self_feedback_count = 0
+        classifications: Dict[str, int] = {}
+
+        for instance, dff in sorted(nl.dffs.items()):
+            memo: Dict[str, bool] = {}
+            active: Set[str] = set()
+
+            def depends_on_own_q(signal: str) -> bool:
+                if signal == dff.q:
+                    return True
+                if signal in memo:
+                    return memo[signal]
+                if signal in dff_qs or signal in {"1'b0", "1'b1"}:
+                    memo[signal] = False
+                    return False
+                node = drivers.get(signal)
+                if node is None or signal in active:
+                    memo[signal] = False
+                    return False
+                active.add(signal)
+                result = any(depends_on_own_q(inp) for inp in node.inputs)
+                active.discard(signal)
+                memo[signal] = result
+                return result
+
+            if not depends_on_own_q(dff.d):
+                continue
+            self_feedback_count += 1
+
+            local_distance_memo: Dict[Tuple[str, int], Optional[int]] = {}
+
+            def local_q_distance(signal: str, budget: int = 6) -> Optional[int]:
+                """Return the shortest nearby gate distance to this DFF's Q."""
+                if signal == dff.q:
+                    return 0
+                if budget <= 0 or signal in dff_qs:
+                    return None
+                key = (signal, budget)
+                if key in local_distance_memo:
+                    return local_distance_memo[key]
+                node = drivers.get(signal)
+                if node is None:
+                    local_distance_memo[key] = None
+                    return None
+                child_distances = [
+                    distance
+                    for inp in node.inputs
+                    if (distance := local_q_distance(inp, budget - 1)) is not None
+                ]
+                result = 1 + min(child_distances) if child_distances else None
+                local_distance_memo[key] = result
+                return result
+
+            def identity_feedback(signal: str) -> bool:
+                parity = 0
+                seen: Set[str] = set()
+                while signal not in seen:
+                    if signal == dff.q:
+                        return parity == 0
+                    seen.add(signal)
+                    node = drivers.get(signal)
+                    if node is None or len(node.inputs) != 1:
+                        return False
+                    if node.gate_type == "not":
+                        parity ^= 1
+                    elif node.gate_type != "buf":
+                        return False
+                    signal = node.inputs[0]
+                return False
+
+            merge_node: Optional[GateNode] = None
+            queue: deque[str] = deque([dff.d])
+            visited: Set[str] = set()
+            while queue and merge_node is None:
+                signal = queue.popleft()
+                if signal in visited or signal == dff.q:
+                    continue
+                visited.add(signal)
+                node = drivers.get(signal)
+                if node is None:
+                    continue
+                flags = [local_q_distance(inp) is not None for inp in node.inputs]
+                if any(flags) and not all(flags):
+                    merge_node = node
+                    break
+                queue.extend(
+                    inp for inp, flag in zip(node.inputs, flags) if flag
+                )
+
+            if identity_feedback(dff.d):
+                classification = "direct_hold"
+            elif merge_node is not None:
+                classification = (
+                    "and_gated_hold_candidate"
+                    if merge_node.gate_type == "and"
+                    else "mux_or_gated_hold_candidate"
+                )
+            elif "self_feedback" in requested:
+                classification = "self_feedback_only"
+            else:
+                continue
+
+            feedback_signals = [dff.d]
+            feedback_gates: List[str] = []
+            signal = dff.d
+            seen_path: Set[str] = set()
+            while signal != dff.q and signal not in seen_path:
+                seen_path.add(signal)
+                node = drivers.get(signal)
+                if node is None:
+                    break
+                feedback_gates.append(node.name)
+                candidates = [
+                    (distance, inp)
+                    for inp in node.inputs
+                    if (distance := local_q_distance(inp)) is not None
+                ]
+                next_signal = min(candidates)[1] if candidates else None
+                if next_signal is None:
+                    break
+                signal = next_signal
+                feedback_signals.append(signal)
+            feedback_signals.reverse()
+            feedback_gates.reverse()
+
+            merge_flags = (
+                [local_q_distance(inp) is not None for inp in merge_node.inputs]
+                if merge_node is not None
+                else []
+            )
+            q_branches = (
+                [inp for inp, flag in zip(merge_node.inputs, merge_flags) if flag]
+                if merge_node is not None
+                else []
+            )
+            data_branches = (
+                [inp for inp, flag in zip(merge_node.inputs, merge_flags) if not flag]
+                if merge_node is not None
+                else []
+            )
+            item = {
+                "dff": instance,
+                "q_signal": dff.q,
+                "d_signal": dff.d,
+                "classification": classification,
+                "validation": "structural",
+                "d_driver": drivers[dff.d].name if dff.d in drivers else None,
+                "merge_gate": merge_node.name if merge_node else None,
+                "merge_gate_type": merge_node.gate_type if merge_node else None,
+                "q_dependent_branches": q_branches,
+                "q_independent_branches": data_branches,
+                "feedback_signals": feedback_signals,
+                "feedback_gates": feedback_gates,
+            }
+            matches.append(item)
+            classifications[classification] = classifications.get(classification, 0) + 1
+
+        result = {
+            "dffs_examined": len(nl.dffs),
+            "structure_types": sorted(requested),
+            "validation": "structural",
+            "self_feedback_candidates": self_feedback_count,
+            "count": len(matches),
+            "classification_breakdown": dict(sorted(classifications.items())),
+        }
+        if len(matches) <= inline_limit:
+            result["matches"] = matches
+            return result
+
+        report = tempfile.NamedTemporaryFile(
+            "w",
+            prefix="dff_d_input_structures_",
+            suffix=".jsonl",
+            dir=_workspace_temp_dir(),
+            delete=False,
+        )
+        with report:
+            for item in matches:
+                report.write(json.dumps(item, sort_keys=True) + "\n")
+        result["sample_matches"] = matches[: min(10, inline_limit)]
         result["file_path"] = os.path.abspath(report.name)
         return result
 
@@ -4127,7 +4397,7 @@ sat -prove {prove_signal} {prove_value} -verify
         gate_type: str = "",
         input_count: Optional[int] = None,
         has_input: Optional[str] = None,
-        inline_limit: int = 50,
+        inline_limit: int = 10,
     ) -> dict:
         """Find combinational gates matching structural filters."""
         self._require_netlist()

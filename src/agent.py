@@ -73,7 +73,10 @@ _SYSTEM_PROMPT = (
     "expression like NAND(a,b), OR(a,b), or XOR(a,b) equals a target signal, use "
     "find_binary_gate_equivalent_pair; do not approximate this by listing existing "
     "gates of that type. For prompts asking to list flip-flops driven or clocked by "
-    "a named clock signal, use list_flip_flops_by_clock. For highest/lowest fanout "
+    "a named clock signal, use list_flip_flops_by_clock. For requests to report or "
+    "count enable/hold structures in flip-flop D-input "
+    "logic, use analyze_dff_d_input_structures; do not use register-to-register "
+    "path enumeration for that analysis. For highest/lowest fanout "
     "across a signal class, use rank_signals_by_fanout. For functional symmetry "
     "in two named inputs, use check_function_symmetry. For largest/smallest fanin "
     "cones, use rank_signals_by_fanin_cone with gate_count. For depth optimization "
@@ -350,6 +353,18 @@ class EDAAgent:
             or "cost function is depth of the cone" in prompt
         )
 
+    def _prompt_requests_depth_optimization(self) -> bool:
+        """Return True only when the request states a depth/path objective."""
+        prompt = getattr(self, "_active_user_message", "")
+        return bool(
+            re.search(
+                r"\b(?:depth|logic\s+levels?|critical\s+path|longest\s+path|"
+                r"max(?:imum)?\s+path|timing|path\s+delay)\b",
+                prompt,
+                re.IGNORECASE,
+            )
+        )
+
     def _compact_tool_result_for_llm(
         self, tool_name: str, result_str: str
     ) -> str:
@@ -358,6 +373,31 @@ class EDAAgent:
             payload = json.loads(result_str)
         except json.JSONDecodeError:
             return self._truncate_text(result_str)
+
+        # This report can contain thousands of detailed matches.  Preserve its
+        # semantics and stable metadata instead of falling through to generic
+        # tail truncation, which can hide the count and make arbitrary tail
+        # records look like the complete result.
+        if tool_name == "analyze_dff_d_input_structures":
+            data = payload.get("result")
+            if isinstance(data, dict):
+                matches = data.get("matches") or data.get("sample_matches") or []
+                file_path = data.get("file_path")
+                compact_result = {
+                    "result_kind": "structural_enable_hold_candidates",
+                    "validation": data.get("validation", "structural"),
+                    "dffs_examined": data.get("dffs_examined"),
+                    "self_feedback_candidates": data.get("self_feedback_candidates"),
+                    "count": data.get("count"),
+                    "classification_breakdown": data.get(
+                        "classification_breakdown", {}
+                    ),
+                    "sample_matches": matches[:3],
+                    "sample_matches_are_complete_list": not bool(file_path),
+                    "file_path": file_path,
+                    "file_path_type": "local" if file_path else None,
+                }
+                return json.dumps({"result": compact_result})
 
         # A singular path is a bounded witness/counterexample, not a collection
         # of independent results.  Keep it intact so the LLM can report a valid
@@ -583,6 +623,10 @@ class EDAAgent:
                 f"{data.get('through')} ({path_state})"
             )
         elif tool_name == "find_articulation_points":
+            if "shared_count" in data:
+                return self._summarize_tool_result(
+                    "find_shared_fanin_gates", result_str
+                )
             src = data.get("source", "?")
             snk = data.get("sink", "?")
             count = data.get("count", 0)
@@ -591,6 +635,16 @@ class EDAAgent:
                 f"find_articulation_points: {count} gate(s) between {src} and {snk}"
                 + (f" ({gates})" if gates else "")
             )
+        elif tool_name == "find_shared_fanin_gates":
+            summary = (
+                f"find_shared_fanin_gates: {data.get('shared_count', 0)} shared "
+                f"gate(s) between cones of {data.get('signal_a')} "
+                f"({data.get('cone_a_count', 0)} gates) and {data.get('signal_b')} "
+                f"({data.get('cone_b_count', 0)} gates)"
+            )
+            if data.get("file_path"):
+                summary += f"; full list in {data['file_path']}"
+            return summary
         elif tool_name == "is_wire_cut_between_primary_ios":
             answer = "YES" if data.get("is_cut_between_primary_io") else "NO"
             return (
@@ -612,6 +666,13 @@ class EDAAgent:
                 f"{data.get('depth')}"
             )
         elif tool_name == "get_deepest_output_fanin_cone":
+            # Dispatch may correct a semantically wrong depth-tool selection for
+            # an explicit largest/smallest-cone request. Summarize the operation
+            # that actually ran so history retains its gate-count metric.
+            if data.get("metric") == "gate_count" and "signal_class" in data:
+                return self._summarize_tool_result(
+                    "rank_signals_by_fanin_cone", result_str
+                )
             summary = (
                 f"get_deepest_output_fanin_cone: depth={data.get('max_depth')}; "
                 f"{data.get('tie_count', 0)} tied output bit(s)"
@@ -937,6 +998,17 @@ class EDAAgent:
             if data.get("file_path"):
                 summary += f"; full list in {data['file_path']}"
             return summary
+        elif tool_name == "analyze_dff_d_input_structures":
+            summary = (
+                "analyze_dff_d_input_structures: examined "
+                f"{data.get('dffs_examined', 0)} DFF(s), found "
+                f"{data.get('count', 0)} structural enable/hold candidate(s); "
+                f"self-feedback candidates={data.get('self_feedback_candidates', 0)}; "
+                f"breakdown={data.get('classification_breakdown', {})}"
+            )
+            if data.get("file_path"):
+                summary += f"; full report in {data['file_path']}"
+            return summary
         elif tool_name == "check_signal_constant":
             answer = "yes" if data.get("always_equal") else "no"
             return (
@@ -959,6 +1031,12 @@ class EDAAgent:
             restricted = f" using only {restriction}" if restriction else ""
             return f"reduce_critical_path: depth {before} → {after} (improved by {imp}){restricted} {'OK' if ok else 'NO IMPROVEMENT'}"
         elif tool_name == "optimize_depth_preserving_cone_gate_set":
+            if {
+                "gates_before", "gates_after", "gate_types_after"
+            }.issubset(data):
+                return self._summarize_tool_result(
+                    "remap_cone_with_gates", result_str
+                )
             before = data.get("depth_before", "?")
             after_unrestricted = data.get("depth_after_unrestricted", "?")
             after = data.get("depth_after", "?")
@@ -976,6 +1054,12 @@ class EDAAgent:
                 f"(improved by {imp}); cone of {sig} restricted to {gates} {status}"
             )
         elif tool_name == "optimize_cone_depth_preserving_gate_set":
+            if {
+                "gates_before", "gates_after", "gate_types_after"
+            }.issubset(data):
+                return self._summarize_tool_result(
+                    "remap_cone_with_gates", result_str
+                )
             before = data.get("depth_before", "?")
             after = data.get("depth_after", "?")
             imp = data.get("improvement", "?")
@@ -1414,6 +1498,21 @@ class EDAAgent:
                 args["output_signal"]
             )
         if tool_name == "get_deepest_output_fanin_cone":
+            prompt = getattr(self, "_active_user_message", "").lower()
+            size_request = (
+                "fanin cone" in prompt
+                and any(word in prompt for word in ("largest", "smallest"))
+                and not any(word in prompt for word in ("deepest", "shallowest", "depth"))
+            )
+            if size_request:
+                return eng.rank_signals_by_fanin_cone(
+                    "PO",
+                    "gate_count",
+                    "ascending" if "smallest" in prompt else "descending",
+                    1,
+                    True,
+                    100,
+                )
             return eng.get_deepest_output_fanin_cone()
         if tool_name == "count_outputs_by_logic_depth":
             return eng.count_outputs_by_logic_depth(
@@ -1435,12 +1534,27 @@ class EDAAgent:
             return {"path": path}
 
         if tool_name == "find_articulation_points":
+            prompt = getattr(self, "_active_user_message", "").lower()
+            if (
+                "fanin cone" in prompt
+                and any(word in prompt for word in ("shared", "common", "intersection"))
+            ):
+                return eng.find_shared_fanin_gates(
+                    args["source"], args["sink"]
+                )
             return eng.find_articulation_points(
                 args["source"], args["sink"]
             )
 
         if tool_name == "get_logic_cone":
             return eng.get_logic_cone_report(args["output_signal"])
+
+        if tool_name == "find_shared_fanin_gates":
+            return eng.find_shared_fanin_gates(
+                args["signal_a"],
+                args["signal_b"],
+                int(args.get("inline_limit", 20)),
+            )
 
         if tool_name == "derive_boolean_equation":
             result = eng.derive_boolean_equation(
@@ -1498,7 +1612,7 @@ class EDAAgent:
                 args.get("gate_type", ""),
                 args.get("input_count"),
                 args.get("has_input"),
-                args.get("inline_limit", 50),
+                min(int(args.get("inline_limit", 10)), 10),
             )
         if tool_name == "find_gates_with_constant_inputs":
             return eng.find_gates_with_constant_inputs(
@@ -1524,10 +1638,18 @@ class EDAAgent:
                 int(args.get("inline_limit", 100)),
             )
         if tool_name == "rank_signals_by_fanin_cone":
+            prompt = getattr(self, "_active_user_message", "").lower()
+            explicit_size_request = (
+                "fanin cone" in prompt
+                and any(word in prompt for word in ("largest", "smallest"))
+                and not any(word in prompt for word in ("deepest", "shallowest", "depth"))
+            )
             return eng.rank_signals_by_fanin_cone(
-                args["signal_class"],
-                args.get("metric", "gate_count"),
-                args.get("order", "descending"),
+                "PO" if explicit_size_request and "output" in prompt else args["signal_class"],
+                "gate_count" if explicit_size_request else args.get("metric", "gate_count"),
+                (
+                    "ascending" if "smallest" in prompt else "descending"
+                ) if explicit_size_request else args.get("order", "descending"),
                 int(args.get("limit", 1)),
                 bool(args.get("include_ties", True)),
                 int(args.get("inline_limit", 100)),
@@ -1552,6 +1674,12 @@ class EDAAgent:
             return eng.list_flip_flops_by_clock(
                 args["clock_signal"],
                 int(args.get("inline_limit", 50)),
+            )
+
+        if tool_name == "analyze_dff_d_input_structures":
+            return eng.analyze_dff_d_input_structures(
+                args.get("structure_types"),
+                int(args.get("inline_limit", 20)),
             )
 
         if tool_name == "insert_gate_before":
@@ -1677,6 +1805,11 @@ class EDAAgent:
             return eng.reduce_critical_path(args.get("allowed_gates"))
 
         if tool_name == "optimize_depth_preserving_cone_gate_set":
+            if not self._prompt_requests_depth_optimization():
+                return eng.remap_cone_with_gates(
+                    args["output_signal"],
+                    args["allowed_gates"],
+                )
             if self._prompt_uses_cone_depth_cost():
                 return eng.optimize_cone_depth_preserving_gate_set(
                     args["output_signal"],
@@ -1690,6 +1823,11 @@ class EDAAgent:
             )
 
         if tool_name == "optimize_cone_depth_preserving_gate_set":
+            if not self._prompt_requests_depth_optimization():
+                return eng.remap_cone_with_gates(
+                    args["output_signal"],
+                    args["allowed_gates"],
+                )
             return eng.optimize_cone_depth_preserving_gate_set(
                 args["output_signal"],
                 args["allowed_gates"],

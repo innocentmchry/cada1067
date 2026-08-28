@@ -151,7 +151,9 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "get_deepest_output_fanin_cone",
             "description": (
                 "Find the primary-output bit or tied bits with the deepest combinational "
-                "fanin cone. DFF outputs are treated as boundaries."
+                "fanin cone, measured by logic depth. DFF outputs are treated as boundaries. "
+                "Do not use this for 'largest' or 'smallest fanin cone'; those mean cone "
+                "gate count and must use rank_signals_by_fanin_cone with metric=gate_count."
             ),
             "parameters": {
                 "type": "object",
@@ -366,7 +368,9 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "rank_signals_by_fanin_cone",
             "description": (
                 "Rank every signal in a complete class by fanin-cone gate count or "
-                "logic depth. Use gate_count for largest/smallest cone questions and "
+                "logic depth. Use this exact tool with signal_class=PO and metric=gate_count "
+                "for questions such as 'Which output has the largest fanin cone?'. "
+                "Use gate_count for largest/smallest cone questions and "
                 "depth only for deepest/shallowest questions. PO buses are expanded "
                 "into bits, and registered PO/DFF-Q signals use the same Q-to-D "
                 "next-state cone resolution as count_gate_types_in_cone."
@@ -425,6 +429,31 @@ TOOLS: List[Dict[str, Any]] = [
                     }
                 },
                 "required": ["output_signal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_shared_fanin_gates",
+            "description": (
+                "Find all gate instances shared by the transitive fanin cones of two "
+                "signals. This computes the intersection of two backward logic cones; "
+                "use it for gates shared/common between fanin-cone requests. It is not "
+                "an articulation-point or source-to-sink path query. Registered outputs "
+                "are resolved through their D-input next-state cones."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "signal_a": {"type": "string", "description": "First signal or output."},
+                    "signal_b": {"type": "string", "description": "Second signal or output."},
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum shared gates inline before writing a report file.",
+                    },
+                },
+                "required": ["signal_a", "signal_b"],
             },
         },
     },
@@ -827,6 +856,35 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_dff_d_input_structures",
+            "description": (
+                "Analyze every DFF's D-input logic for structural enable or hold "
+                "patterns involving feedback from that DFF's own Q output. Use this "
+                "for requests to report or count flip-flops with enable/hold logic "
+                "implemented through multiplexing or gates. Do not enumerate "
+                "register-to-register paths for this purpose. Results are structural "
+                "candidates, with an exact count and a file_path for large reports."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "structure_types": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["enable", "hold"]},
+                        "description": "Requested structure classes; defaults to both enable and hold.",
+                    },
+                    "inline_limit": {
+                        "type": "integer",
+                        "description": "Maximum matches returned inline; larger reports are written to a file.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "insert_gate_before",
             "description": (
                 "Call this to insert a new 2-input gate immediately before an existing gate instance. "
@@ -1078,7 +1136,7 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                     "inline_limit": {
                         "type": "integer",
-                        "description": "Maximum number of matches to return inline before writing the full list to ./_tmp/. Defaults to 50.",
+                        "description": "Maximum number of matches to return inline before writing the full list to ./_tmp/. Defaults to 10.",
                     },
                 },
                 "required": [],
