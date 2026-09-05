@@ -978,6 +978,9 @@ class EDAAgent:
                 )
             return f"fraig_merge_equivalent_gates: FAILED"
         elif tool_name == "check_signal_equivalence":
+            statement = data.get("statement")
+            if statement:
+                return f"check_signal_equivalence: {data.get('verdict')} — {statement}"
             return f"check_signal_equivalence: equivalent={data.get('equivalent')}"
         elif tool_name == "check_function_symmetry":
             answer = "YES" if data.get("symmetric") else "NO"
@@ -1896,7 +1899,27 @@ class EDAAgent:
 
         if tool_name == "check_signal_equivalence":
             equiv = eng.check_signal_equivalence(args["sig1"], args["sig2"])
-            return {"equivalent": equiv}
+            sig1 = args["sig1"]
+            sig2 = args["sig2"]
+            if equiv:
+                statement = (
+                    f"Signals {sig1} and {sig2} produce identical logic values for all "
+                    "input assignments and are functionally equivalent."
+                )
+            else:
+                statement = (
+                    f"Signals {sig1} and {sig2} do not produce identical logic values for all "
+                    "input assignments and are not functionally equivalent."
+                )
+            return {
+                "signal_1": sig1,
+                "signal_2": sig2,
+                "equivalent": equiv,
+                "identical_for_all_inputs": equiv,
+                "verdict": "EQUIVALENT" if equiv else "NOT_EQUIVALENT",
+                "statement": statement,
+                "response_instruction": "Report the statement without reversing its conclusion.",
+            }
         if tool_name == "check_function_symmetry":
             return eng.check_function_symmetry(
                 args["output_signal"], args["input_a"], args["input_b"]

@@ -699,7 +699,8 @@ TOOLS: List[Dict[str, Any]] = [
                 "Return ALL instances directly connected to a SIGNAL or WIRE, including both "
                 "the instance(s) that drive it and the gates/DFF ports that consume it. Use this "
                 "for wording such as 'all gates connected to signal n1' or 'what drives and uses n1'. "
-                "For downstream consumers only, use get_net_fanout instead."
+                "For downstream consumers only, use get_net_fanout instead. Do not call this after "
+                "get_net_fanout has returned a complete file-backed result for the same signal."
             ),
             "parameters": {
                 "type": "object",

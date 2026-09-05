@@ -2298,6 +2298,10 @@ class EDAEngine:
             for gate_name in fanout:
                 report.write(f"{gate_name}\n")
         result["file_path"] = os.path.abspath(report.name)
+        result["complete_result_in_file"] = True
+        result["file_contents"] = "all direct fanout gate names"
+        result["additional_tool_needed"] = False
+        result["response_instruction"] = "Report the count and exact file_path."
         return result
 
     def rank_signals_by_fanout(
